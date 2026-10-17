@@ -389,7 +389,9 @@ def process(url, cut, cfg, work):
             log.error("ffmpeg кусок: %s", r.stderr[-2000:])
             raise JobError(explain(url, r.stderr) or f"не вырезал кусок, {OWNER} посмотрит")
     else:
-        ytdlp(["--no-playlist", "--no-warnings", "--no-progress", "-S", "res,fps,vcodec:h264,acodec:aac",
+        # у клипа Twitch есть «portrait-…» — вертикальная обрезка; по высоте она больше 1080 и выиграла бы
+        fmt = ["-f", "b[format_id!^=portrait]/b"] if "twitch.tv" in url else []
+        ytdlp(["--no-playlist", "--no-warnings", "--no-progress", *fmt, "-S", "res,fps,vcodec:h264,acodec:aac",
                "--merge-output-format", "mp4", "--remux-video", "mp4",
                "--ffmpeg-location", FFMPEG.parent, "-o", str(work / "src.%(ext)s")], url, 1800)
         src = next(iter(sorted(work.glob("src.*"))), None)
