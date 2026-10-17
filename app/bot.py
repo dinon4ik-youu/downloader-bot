@@ -841,8 +841,11 @@ class Bot:
             except JobError as e:
                 await self.edit(ph, f"❌ Не скачал: {esc(str(e))} · {link(url)}")
                 if "Instagram" in str(e):
-                    await self.tell_owner("Instagram перестал пускать без входа — пора добавить запасные "
-                                          "аккаунты (этап 2 в notes/plans.md, файл accounts/instagram-bot-pool.txt).")
+                    await self.tell_owner(
+                        "Instagram перестал пускать без входа — ссылки с Instagram сейчас не скачиваются. "
+                        "Обычно через несколько часов проходит само; остальные сайты работают." if KIT else
+                        "Instagram перестал пускать без входа — пора добавить запасные "
+                        "аккаунты (этап 2 в notes/plans.md, файл accounts/instagram-bot-pool.txt).")
             except Exception:
                 log.exception("сбой на %s", key)
                 await self.edit(ph, f"❌ Не скачал, {OWNER} посмотрит · {link(url)}")
