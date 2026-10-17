@@ -17,10 +17,10 @@
   ссылка 1:20-1:45       отрезок (м:сс); у длинных — 1:20:00-1:20:10 (ч:мм:сс)
 
 Темы группы (бот создаёт сам, 17.10.2026):
-  «Выбор клипов»  ссылка на запись стрима Kick (или на канал = последний стрим) → 10 моментов: превью
+  «Выбор клипов»  ссылка на запись стрима Kick или Twitch (или на канал = последний стрим) → 10 моментов: превью
                   главного клипа в 360p + ссылка на длинный клип с панчем посередине; «ещё» — следующие 10.
                   Ответ на превью: «ок» / «+» — целиком, или обрезка как выше (-1 -5, до 20…) →
-                  клип в полном качестве уходит в «Отобранные». Моменты — tools/kick_clips.py.
+                  клип в полном качестве уходит в «Отобранные». Моменты — tools/kick_clips.py, twitch_clips.py.
   остальные       обычная качалка, ответ в той же теме.
 
 Секреты (не пересылать, в bgswap-kit не класть): tools/shared-bot-token.txt,
@@ -115,7 +115,7 @@ HINT = ("<b>Как пользоваться</b>\n"
         "Время: <code>80</code> — секунды, <code>1:20</code> — мин:сек, <code>1:20:00</code> — ч:мин:сек\n"
         "<pre>kick.com/…/clip_AAA -14\n"
         "kick.com/…/videos/BBB 1:20:00-1:20:10</pre>\n"
-        "<b>Выбор клипов</b>: ссылка на запись стрима → превью моментов. Кнопка «✅ Беру целиком» "
+        "<b>Выбор клипов</b>: ссылка на запись стрима Kick или Twitch → превью моментов. Кнопка «✅ Беру целиком» "
         "под превью (или ответ «ок») — клип в «Отобранные»; с обрезкой — ответь на превью: "
         "<code>-1 -5</code>, <code>до 20</code>. «➡️ Ещё» — следующие моменты.")
 
@@ -434,30 +434,56 @@ def kick():
     return kc
 
 
-def kick_stream_link(url):
-    """kick.com/<канал>/videos/<uuid> → (канал, uuid); kick.com/<канал> → (канал, None); иначе None."""
+def twitch():
+    """twitch_clips.py — там же, кэш общий с Kick."""
+    kick()
+    import twitch_clips as tw
+    if KICK_CACHE:
+        tw.CACHE = KICK_CACHE
+    return tw
+
+
+def stream_link(url):
+    """Ссылка на запись стрима или канал → (сайт, канал, запись); иначе None.
+    kick.com/<канал>/videos/<uuid>, twitch.tv/videos/<id>; ссылка на канал = последний стрим."""
     p = urlsplit(url)
     seg = [s for s in p.path.split("/") if s]
-    if "kick.com" not in p.netloc or not seg:
-        return None
-    if len(seg) == 1:
-        return seg[0], None
-    if len(seg) == 3 and seg[1] == "videos":
-        return seg[0], seg[2]
+    if "kick.com" in p.netloc and seg:
+        if len(seg) == 1:
+            return "kick", seg[0], None
+        if len(seg) == 3 and seg[1] == "videos":
+            return "kick", seg[0], seg[2]
+    if p.netloc.lower().removeprefix("www.").removeprefix("m.") == "twitch.tv" and seg:
+        if len(seg) == 2 and seg[0] == "videos" and seg[1].isdigit():
+            return "twitch", None, seg[1]
+        if len(seg) == 1 and re.fullmatch(r"\w{2,25}", seg[0]) and seg[0].lower() not in ("videos", "directory"):
+            return "twitch", seg[0].lower(), None
     return None
 
 
-def stream_moments(channel, uuid):
+def stream_moments(site, channel, rec):
     """→ (стрим, число клипов, моменты от самых заклипанных). Блокирующая — гоняется в потоке."""
-    kc = kick()
-    st = kc.streams(channel)
-    s = kc.find_stream(st, uuid) if uuid else (st[0] if st else None)
-    if not s:
-        raise JobError("стрим не найден — нужна ссылка на запись: kick.com/<канал>/videos/…")
-    cache = kc.CACHE / f"{channel}_{s['id']}.json"
+    if site == "twitch":
+        tw = twitch()
+        try:
+            s = tw.video(rec) if rec else next(iter(tw.streams(channel)), None)
+        except OSError as e:
+            raise JobError(f"Twitch не ответил: {e}")
+        if not s:
+            raise JobError("запись не найдена — на Twitch они живут 7–60 дней; нужна ссылка twitch.tv/videos/…")
+        cache = tw.CACHE / f"twitch_{s['login']}_{s['id']}.json"
+        collect = lambda fresh: tw.collect(s, fresh)
+    else:
+        kc = kick()
+        st = kc.streams(channel)
+        s = kc.find_stream(st, rec) if rec else (st[0] if st else None)
+        if not s:
+            raise JobError("стрим не найден — нужна ссылка на запись: kick.com/<канал>/videos/…")
+        cache = kc.CACHE / f"{channel}_{s['id']}.json"
+        collect = lambda fresh: kc.collect(channel, s, fresh)
     fresh = not cache.exists() or time.time() - cache.stat().st_mtime > KICK_CACHE_MAX_H * 3600
-    cl = kc.collect(channel, s, fresh)
-    ms = sorted((m for m in kc.moments(cl) if m["n"] >= PICK_MIN_CLIPS), key=lambda m: -m["n"])
+    cl = collect(fresh)
+    ms = sorted((m for m in kick().moments(cl) if m["n"] >= PICK_MIN_CLIPS), key=lambda m: -m["n"])
     return s, len(cl), ms
 
 
@@ -476,11 +502,19 @@ def fetch_hls(m3u8, dst):
             f.write(get(urljoin(m3u8, u)))
 
 
-def make_preview(clip_id, work):
+def make_preview(clip_id, work, site="kick"):
     """Главный клип целиком в 360p (~1–2 МБ) — посмотреть прямо в Telegram.
-    Прямо из плейлиста клипа одним ffmpeg: ~10 с против ~40 через yt-dlp."""
-    kc = kick()
+    Kick — прямо из плейлиста клипа одним ffmpeg: ~10 с против ~40 через yt-dlp.
+    Twitch — у клипа готовый mp4 360p, yt-dlp его просто скачивает."""
     work.mkdir(parents=True, exist_ok=True)
+    if site == "twitch":
+        prev = work / "preview.mp4"
+        ytdlp(["--no-warnings", "--no-progress", "-f", "360/worst[height>=360]/worst", "-o", str(prev)],
+              f"https://clips.twitch.tv/{clip_id}", 300)
+        if not prev.exists():
+            raise JobError("не сделал превью")
+        return preview_done(prev, work)
+    kc = kick()
     try:
         d = kc.get(f"https://kick.com/api/v2/clips/{clip_id}")
     except OSError:
@@ -501,6 +535,10 @@ def make_preview(clip_id, work):
     if r.returncode != 0 or not prev.exists():
         log.error("превью: %s", r.stderr[-1000:])
         raise JobError("не сделал превью")
+    return preview_done(prev, work)
+
+
+def preview_done(prev, work):
     q = probe(prev)
     thumb = work / "thumb.jpg"
     run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-ss", "3", "-i", prev, "-frames:v", "1", thumb], 60)
@@ -769,12 +807,13 @@ class Bot:
             await self.pick_queue.put({"kind": "more", "reply_to": event.id})
             return True
         for url, cut, _q, _o in parse_message(text):
-            k = kick_stream_link(url)
+            k = stream_link(url)
             if k and not cut:
-                ph = await self.send(f"⏳ Собираю клипы стрима · {link(url)}\nпервый раз — до ~5 мин",
+                wait = "до ~5 мин" if k[0] == "kick" else "до минуты"
+                ph = await self.send(f"⏳ Собираю клипы стрима · {link(url)}\nпервый раз — {wait}",
                                      topic=self.pick_topic, reply_to=event.id)
-                await self.pick_queue.put({"kind": "stream", "channel": k[0], "uuid": k[1], "url": url,
-                                           "ph": ph.id})
+                await self.pick_queue.put({"kind": "stream", "site": k[0], "channel": k[1], "uuid": k[2],
+                                           "url": url, "ph": ph.id})
                 return True
         return False  # прочие ссылки — обычной качалкой, ответ в этой же теме
 
@@ -784,8 +823,10 @@ class Bot:
             job = await self.pick_queue.get()
             try:
                 if job["kind"] == "stream":
-                    s, total, moments = await asyncio.to_thread(stream_moments, job["channel"], job["uuid"])
-                    self.state["pick"] = {"channel": job["channel"], "title": s["title"], "start": s["start"],
+                    site = job.get("site", "kick")
+                    s, total, moments = await asyncio.to_thread(stream_moments, site, job["channel"], job["uuid"])
+                    self.state["pick"] = {"site": site, "channel": s.get("login") or job["channel"],
+                                          "title": s["title"], "start": s["start"],
                                           "moments": moments, "next": 0}
                     self.save()
                     await self.edit(job["ph"], f"📺 <b>{esc(s['title'])}</b> · {s['start'][:10]} · "
@@ -815,15 +856,17 @@ class Bot:
         for i in range(i0, min(i0 + PICK_BATCH, len(moments))):
             m = moments[i]
             sh, lg, p = m["short"], m["long"], m["punch"]
-            url = f"https://kick.com/{ch}/clips/{sh['id']}"
-            long_url = f"https://kick.com/{ch}/clips/{lg['id']}"
+            site = st.get("site", "kick")
+            clip = (lambda c: f"https://clips.twitch.tv/{c['id']}") if site == "twitch" else (
+                lambda c: f"https://kick.com/{ch}/clips/{c['id']}")
+            url, long_url = clip(sh), clip(lg)
             caption = (f"<b>{i + 1}/{len(moments)}</b> · панч {hms(p)} · заклипали {m['n']} раз\n"
                        f"клип {int(sh['e'] - sh['s'])} с, панч на {ms(p - sh['s'])} · {link(url)}\n"
                        f"длинный {int(lg['e'] - lg['s'])} с, панч на {ms(p - lg['s'])} · {link(long_url)}")
             n += 1
             work = Path(self.cfg["tmp_dir"]) / f"pick{n}"
             try:
-                prev, q = await asyncio.to_thread(make_preview, sh["id"], work)
+                prev, q = await asyncio.to_thread(make_preview, sh["id"], work, site)
                 media = video_media(await self.client.upload_file(str(prev)),
                                     await self.client.upload_file(str(q["thumb"])) if q["thumb"] else None,
                                     q, f"{ch}_{i + 1}")
