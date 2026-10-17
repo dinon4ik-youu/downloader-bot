@@ -1,0 +1,6 @@
+data/
+bin/
+tmp/
+clips/
+__pycache__/
+*.session*
