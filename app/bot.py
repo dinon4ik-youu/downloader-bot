@@ -31,6 +31,7 @@ import html
 import json
 import logging
 import msvcrt
+import os
 import re
 import shutil
 import ssl
@@ -303,6 +304,19 @@ def update_ytdlp():
         log.info("yt-dlp -U: %s", (r.stdout + r.stderr).strip().splitlines()[-1:])
     except Exception as e:  # нет интернета и т.п. — работаем на старой
         log.warning("yt-dlp -U не вышло: %s", e)
+
+
+def warm_certs():
+    """Заход через curl.exe (schannel): Windows сама догружает корневые сертификаты Kick и Telegram,
+    и ffmpeg идёт быстрым путём. На чистой Windows без этого превью — через fetch_hls (песочница 17.10.2026)."""
+    curl = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+    if not curl.exists():
+        return
+    try:
+        run([curl, "-s", "-o", "NUL", "--max-time", "15",
+             "https://clips.kick.com", "https://kick.com", "https://api.telegram.org"], 60)
+    except Exception as e:
+        log.warning("curl для сертификатов не вышел: %s", e)
 
 
 def probe(path):
@@ -1160,6 +1174,7 @@ def main():
     shutil.rmtree(tmp, ignore_errors=True)  # остатки после сбоя
     tmp.mkdir(parents=True, exist_ok=True)
     update_ytdlp()
+    warm_certs()
     asyncio.run(Bot(cfg).main())
 
 
