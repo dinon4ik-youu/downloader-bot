@@ -44,11 +44,13 @@ from urllib.parse import parse_qs, urlsplit
 
 # На чистой Windows в системном хранилище нет корня GoDaddy G2 (api.telegram.org): Windows догружает
 # его сама, Python — нет, и urlopen падает на сертификате. certifi ставит install.ps1 (песочница 17.10.2026).
+# ffmpeg (gnutls) упирается в то же самое на clips.kick.com — ему тот же файл через -ca_file.
 try:
     import certifi
     ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+    FF_TLS = ["-ca_file", certifi.where()]
 except ImportError:
-    pass
+    FF_TLS = []
 
 HERE = Path(__file__).resolve().parent
 # Набор для других (share/downloader-bot-kit): рядом лежит kit.json — свои настройки в <набор>/data,
@@ -357,7 +359,7 @@ def process(url, cut, cfg, work):
             raise JobError("с этого сайта кусок длинного видео не вырезать")
         f = max(fmts, key=lambda f: ((f.get("height") or 0), (f.get("fps") or 0), (f.get("tbr") or 0)))
         hdr = "".join(f"{k}: {v}\r\n" for k, v in (f.get("http_headers") or {}).items())
-        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y"]
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", *FF_TLS]
         if hdr:
             cmd += ["-headers", hdr]
         r = run(cmd + ["-ss", f"{start:.3f}", "-i", f["url"], "-t", f"{end - start:.3f}", *ENC, out], 1800)
@@ -450,7 +452,7 @@ def make_preview(clip_id, work):
     if not m3u8:
         raise JobError("клип удалён")
     prev = work / "preview.mp4"
-    r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", m3u8, "-vf", "scale=-2:360",
+    r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", *FF_TLS, "-i", m3u8, "-vf", "scale=-2:360",
              "-c:v", "libx264", "-crf", "30", "-preset", "veryfast", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", prev], 600)
     if r.returncode != 0 or not prev.exists():
@@ -1078,6 +1080,7 @@ def wizard():
     print("\n3) Группа: создай группу в Telegram, добавь туда бота, сделай его админом")
     print("   (удаление сообщений, закрепление, управление темами), в настройках группы включи «Темы».")
     print("   Потом напиши в группу любое сообщение от себя.")
+    print(f"   И открой @{me['username']} в личке, нажми Start — туда бот пишет владельцу об ошибках.")
     while True:
         input("   Готово? Нажми Enter... ")
         found = None
