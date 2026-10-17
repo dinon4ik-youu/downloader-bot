@@ -110,11 +110,20 @@ def span(c, start):
         return None
     pdt = re.findall(r"PROGRAM-DATE-TIME:(\S+)", t)
     durs = re.findall(r"EXTINF:([\d.]+)", t)
-    if not pdt:
+    try:
+        a = pdt_time(pdt[0])
+        b = pdt_time(pdt[-1]) + timedelta(seconds=float(durs[-1]))
+    except (IndexError, ValueError):  # кривой плейлист у одного клипа не должен ронять весь стрим
         return None
-    a = datetime.fromisoformat(pdt[0].replace("Z", "")[:26])
-    b = datetime.fromisoformat(pdt[-1].replace("Z", "")[:26]) + timedelta(seconds=float(durs[-1]))
     return (a - start).total_seconds(), (b - start).total_seconds()
+
+
+def pdt_time(s):
+    """«2026-10-15T17:26:18.94Z» → datetime. Доли секунды у Kick бывают 1–9 знаков, Python 3.10 ждёт 3 или 6."""
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(?:Z|[+-]00:?00)?", s.strip())
+    if not m:
+        raise ValueError(s)
+    return datetime.fromisoformat(m[1]) + timedelta(microseconds=int((m[2] or "0").ljust(6, "0")[:6]))
 
 
 def collect(slug, s, fresh):
