@@ -475,6 +475,7 @@ def stream_moments(site, channel, rec):
             raise JobError("запись не найдена — на Twitch они живут 7–60 дней; нужна ссылка twitch.tv/videos/…")
         cache = tw.CACHE / f"twitch_{s['login']}_{s['id']}.json"
         collect = lambda fresh: tw.collect(s, fresh)
+        group = lambda cl: tw.moments_of(s, cl)  # канал без записей — моменты по времени создания клипов
     else:
         kc = kick()
         st = kc.streams(channel)
@@ -483,6 +484,7 @@ def stream_moments(site, channel, rec):
             raise JobError("стрим не найден — нужна ссылка на запись: kick.com/<канал>/videos/…")
         cache = kc.CACHE / f"{channel}_{s['id']}.json"
         collect = lambda fresh: kc.collect(channel, s, fresh)
+        group = kc.moments
     fresh = not cache.exists() or time.time() - cache.stat().st_mtime > KICK_CACHE_MAX_H * 3600
     try:
         cl = collect(fresh)
@@ -491,7 +493,10 @@ def stream_moments(site, channel, rec):
             raise
         log.warning("twitch: %s", e)
         raise JobError("Twitch долго не отвечал — кинь ссылку ещё раз через минуту")
-    ms = sorted((m for m in kick().moments(cl) if m["n"] >= PICK_MIN_CLIPS), key=lambda m: -m["n"])
+    # поровну заклипанные — сначала тот, у кого главный клип смотрели больше
+    ms = sorted((m for m in group(cl) if m["n"] >= PICK_MIN_CLIPS), key=lambda m: (-m["n"], -m["short"]["views"]))
+    if site == "twitch" and s.get("approx"):
+        s = {k: v for k, v in s.items() if k != "clips"}  # клипы не тащить в state.json
     return s, len(cl), ms
 
 
@@ -839,7 +844,9 @@ class Bot:
                     self.save()
                     await self.edit(job["ph"], f"📺 <b>{esc(s['title'])}</b> · {s['start'][:10]} · "
                                                f"{link(job['url'])}\nклипов {total} → моментов {len(moments)}, "
-                                               f"самые заклипанные первыми")
+                                               f"самые заклипанные первыми"
+                                               + ("\nзаписи у канала нет — моменты по времени создания "
+                                                  "клипов, время примерное" if s.get("approx") else ""))
                 elif not self.state.get("pick"):
                     await self.send("Сначала кинь ссылку на запись стрима", topic=self.pick_topic,
                                     reply_to=job["reply_to"])
@@ -868,9 +875,14 @@ class Bot:
             clip = (lambda c: f"https://clips.twitch.tv/{c['id']}") if site == "twitch" else (
                 lambda c: f"https://kick.com/{ch}/clips/{c['id']}")
             url, long_url = clip(sh), clip(lg)
-            caption = (f"<b>{i + 1}/{len(moments)}</b> · панч {hms(p)} · заклипали {m['n']} раз\n"
-                       f"клип {int(sh['e'] - sh['s'])} с, панч на {ms(p - sh['s'])} · {link(url)}\n"
-                       f"длинный {int(lg['e'] - lg['s'])} с, панч на {ms(p - lg['s'])} · {link(long_url)}")
+            if m.get("approx"):  # Twitch без записи: секунды панча нет, время — от первого клипа эфира
+                caption = (f"<b>{i + 1}/{len(moments)}</b> · ~{hms(p)} от начала · заклипали {m['n']} раз\n"
+                           f"клип {int(sh['e'] - sh['s'])} с · {link(url)}\n"
+                           f"длинный {int(lg['e'] - lg['s'])} с · {link(long_url)}")
+            else:
+                caption = (f"<b>{i + 1}/{len(moments)}</b> · панч {hms(p)} · заклипали {m['n']} раз\n"
+                           f"клип {int(sh['e'] - sh['s'])} с, панч на {ms(p - sh['s'])} · {link(url)}\n"
+                           f"длинный {int(lg['e'] - lg['s'])} с, панч на {ms(p - lg['s'])} · {link(long_url)}")
             n += 1
             work = Path(self.cfg["tmp_dir"]) / f"pick{n}"
             try:
