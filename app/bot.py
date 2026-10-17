@@ -1072,7 +1072,7 @@ def main():
     if "--apply-update" in sys.argv:
         apply_update()
         return
-    if "--update" in sys.argv and KIT:  # update.bat: обновить сейчас, если есть что
+    if "--update" in sys.argv and KIT:  # «Обновить бота.bat»: обновить сейчас, если есть что
         print("Есть новая версия — обновляю" if download_update() else "Уже последняя версия")
         if UPDATE_ZIP.exists():
             STOP_FLAG.touch()  # работающий бот выйдет сам, --apply-update дождётся

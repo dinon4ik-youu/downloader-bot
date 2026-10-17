@@ -50,23 +50,13 @@ if (-not (Test-Path "$Data\config.json")) {
     Write-Host '      уже настроен (чтобы настроить заново — удали папку data)'
 }
 
-Write-Host '[6/6] Автозапуск и ярлыки'
+Write-Host '[6/6] Автозапуск'
 $action   = New-ScheduledTaskAction -Execute $PyW -Argument "-I `"$Root\app\bot.py`"" -WorkingDirectory $Root
 $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $trigger.Delay = 'PT30S'
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
             -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName 'Downloader bot' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
-
-$desk = [Environment]::GetFolderPath('Desktop')
-$sh = New-Object -ComObject WScript.Shell
-foreach ($s in @(@('Включить бота-качалку', 'start.bat'), @('Выключить бота-качалку', 'stop.bat'))) {
-    $l = $sh.CreateShortcut((Join-Path $desk "$($s[0]).lnk"))
-    $l.TargetPath = Join-Path $Root $s[1]
-    $l.WorkingDirectory = $Root
-    $l.WindowStyle = 7
-    $l.Save()
-}
 
 Start-Process $PyW -ArgumentList "-I `"$Root\app\bot.py`"" -WorkingDirectory $Root
 Write-Host "`nГотово: бот запущен. Через минуту в группе появится закреп «🟢 На связи»."
