@@ -85,7 +85,19 @@ def video(vid):
 def window(login, a, b):
     """Клипы канала, созданные в [a, b): одна страница; полная — делим окно пополам."""
     iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
-    cl = gql(CLIPS_Q, {"l": login, "a": iso(a), "b": iso(b)})["user"]["clips"]
+    for attempt in range(3):  # Twitch иногда отвечает «service timeout» — повтор, потом окно помельче
+        try:
+            cl = gql(CLIPS_Q, {"l": login, "a": iso(a), "b": iso(b)})["user"]["clips"]
+            break
+        except OSError as e:
+            if "timeout" not in str(e) and "server error" not in str(e):
+                raise
+            if attempt == 2:
+                if b - a <= MIN_WINDOW:
+                    raise
+                m = a + (b - a) / 2
+                return window(login, a, m) + window(login, m, b)
+            time.sleep(2 + attempt * 3)
     if cl["pageInfo"]["hasNextPage"] and b - a > MIN_WINDOW:
         m = a + (b - a) / 2
         return window(login, a, m) + window(login, m, b)
@@ -103,7 +115,7 @@ def collect(s, fresh):
     while a < b:
         wins.append((a, min(a + step, b)))
         a += step
-    with ThreadPoolExecutor(8) as ex:
+    with ThreadPoolExecutor(4) as ex:
         parts = list(ex.map(lambda w: window(s["login"], *w), wins))
     seen, res = set(), []
     for c in (c for p in parts for c in p):

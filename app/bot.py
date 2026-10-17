@@ -482,7 +482,13 @@ def stream_moments(site, channel, rec):
         cache = kc.CACHE / f"{channel}_{s['id']}.json"
         collect = lambda fresh: kc.collect(channel, s, fresh)
     fresh = not cache.exists() or time.time() - cache.stat().st_mtime > KICK_CACHE_MAX_H * 3600
-    cl = collect(fresh)
+    try:
+        cl = collect(fresh)
+    except OSError as e:
+        if site != "twitch":
+            raise
+        log.warning("twitch: %s", e)
+        raise JobError("Twitch долго не отвечал — кинь ссылку ещё раз через минуту")
     ms = sorted((m for m in kick().moments(cl) if m["n"] >= PICK_MIN_CLIPS), key=lambda m: -m["n"])
     return s, len(cl), ms
 
@@ -842,7 +848,7 @@ class Bot:
                 if job.get("ph"):
                     await self.edit(job["ph"], f"❌ {esc(str(e))} · {link(job['url'])}")
             except Exception:
-                log.exception("сбор моментов")
+                log.exception("сбор моментов · %s", job.get("url"))
                 if job.get("ph"):
                     await self.edit(job["ph"], f"❌ Не собрал клипы, {OWNER} посмотрит · {link(job['url'])}")
 
