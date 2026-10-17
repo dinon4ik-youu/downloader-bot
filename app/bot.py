@@ -40,7 +40,7 @@ import time
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 # На чистой Windows в системном хранилище нет корня GoDaddy G2 (api.telegram.org): Windows догружает
 # его сама, Python — нет, и urlopen падает на сертификате. certifi ставит install.ps1 (песочница 17.10.2026).
@@ -439,6 +439,21 @@ def stream_moments(channel, uuid):
     return s, len(cl), ms
 
 
+def fetch_hls(m3u8, dst):
+    """HLS-плейлист → один .ts: куски .ts склеиваются подряд. Мастер-плейлист — берётся последний вариант."""
+    def get(u):
+        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read()
+    text = get(m3u8).decode("utf-8", "replace")
+    uris = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    if "#EXT-X-STREAM-INF" in text:
+        return fetch_hls(urljoin(m3u8, uris[-1]), dst)
+    with open(dst, "wb") as f:
+        for u in uris:
+            f.write(get(urljoin(m3u8, u)))
+
+
 def make_preview(clip_id, work):
     """Главный клип целиком в 360p (~1–2 МБ) — посмотреть прямо в Telegram.
     Прямо из плейлиста клипа одним ffmpeg: ~10 с против ~40 через yt-dlp."""
@@ -452,9 +467,15 @@ def make_preview(clip_id, work):
     if not m3u8:
         raise JobError("клип удалён")
     prev = work / "preview.mp4"
-    r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", *FF_TLS, "-i", m3u8, "-vf", "scale=-2:360",
-             "-c:v", "libx264", "-crf", "30", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", prev], 600)
+    enc = ["-vf", "scale=-2:360", "-c:v", "libx264", "-crf", "30", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", prev]
+    r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", *FF_TLS, "-i", m3u8, *enc], 600)
+    if (r.returncode != 0 or not prev.exists()) and "certificate" in r.stderr:
+        # -ca_file не доходит до кусков .ts внутри плейлиста — качаем их сами (urllib + certifi)
+        log.info("превью: ffmpeg не доверяет сертификату, качаю куски сам")
+        ts = work / "clip.ts"
+        fetch_hls(m3u8, ts)
+        r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", ts, *enc], 600)
     if r.returncode != 0 or not prev.exists():
         log.error("превью: %s", r.stderr[-1000:])
         raise JobError("не сделал превью")
