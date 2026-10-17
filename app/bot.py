@@ -33,6 +33,7 @@ import logging
 import msvcrt
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -40,6 +41,14 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+
+# На чистой Windows в системном хранилище нет корня GoDaddy G2 (api.telegram.org): Windows догружает
+# его сама, Python — нет, и urlopen падает на сертификате. certifi ставит install.ps1 (песочница 17.10.2026).
+try:
+    import certifi
+    ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    pass
 
 HERE = Path(__file__).resolve().parent
 # Набор для других (share/downloader-bot-kit): рядом лежит kit.json — свои настройки в <набор>/data,
@@ -1051,8 +1060,10 @@ def wizard():
             with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getMe", timeout=30) as r:
                 me = json.load(r)["result"]
             break
-        except Exception:
+        except urllib.error.HTTPError:
             print("   Токен не подошёл — скопируй его из @BotFather целиком и попробуй ещё раз.\n")
+        except Exception as e:
+            print(f"   Не достучался до Telegram ({e}). Проверь интернет и попробуй ещё раз.\n")
     TOKEN_FILE.write_text(token, encoding="utf-8")
     print(f"   ок, бот @{me['username']}\n")
     print("2) Ключи Telegram: зайди на https://my.telegram.org → API development tools →")
