@@ -7,6 +7,7 @@
   python tools/shared_bot/bot.py --setup   # найти id группы, куда добавлен бот
   tools/shared_bot/stop.bat                # выключить: бот ставит в закреп «🔴 Выключен» и выходит
   /stop в группе (только от владельца)     # то же самое
+  /log в группе (только от владельца)      # лог за сутки файлом — переслать Диме, если сломалось
 
 Форматы — на одной строке со ссылкой:
   ссылка                 целиком
@@ -36,7 +37,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -543,12 +544,15 @@ class Bot:
             rt = types.InputReplyToMessage(reply_to_msg_id=reply_to or topic,
                                            top_msg_id=topic if reply_to and topic else None)
         markup = self.client.build_reply_markup(buttons) if buttons else None
+        # в своих темах бот пишет беззвучно (просьба Димы 17.10.2026): мьютить тему за людей Telegram не даёт
+        silent = bool(topic) and topic in (self.pick_topic, self.done_topic)
         if media is None:
             req = functions.messages.SendMessageRequest(peer=self.peer, message=msg, entities=ent,
-                                                        no_webpage=True, reply_to=rt, reply_markup=markup)
+                                                        no_webpage=True, reply_to=rt, reply_markup=markup,
+                                                        silent=silent)
         else:
             req = functions.messages.SendMediaRequest(peer=self.peer, media=media, message=msg, entities=ent,
-                                                      reply_to=rt, reply_markup=markup)
+                                                      reply_to=rt, reply_markup=markup, silent=silent)
         res = await self.client(req)
         return self.client._get_response_message(req, res, self.peer)
 
@@ -605,6 +609,25 @@ class Bot:
             return r.reply_to_msg_id, None
         return None, r.reply_to_msg_id
 
+    async def send_log(self, event):
+        """/log от владельца: лог за последние сутки файлом — переслать автору бота, если что-то сломалось."""
+        since = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        keep, lines = False, []
+        for line in LOG.read_text(encoding="utf-8", errors="replace").splitlines():
+            if re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", line):
+                keep = line[:19] >= since
+            if keep:  # строки без даты (ошибки) — к своей записи
+                lines.append(line)
+        ver = KIT["version"] if KIT else "бот Димы"
+        out = Path(self.cfg["tmp_dir"]) / f"bot-log_{datetime.now():%Y-%m-%d_%H-%M}.txt"
+        out.write_text(f"версия: {ver}\n\n" + "\n".join(lines[-20000:]), encoding="utf-8")
+        try:
+            await self.client.send_file(self.group, str(out), reply_to=event.id, force_document=True,
+                                        caption=f"Лог за сутки · версия {ver}. Что-то сломалось — перешли этот файл "
+                                                f"автору бота.")
+        finally:
+            out.unlink(missing_ok=True)
+
     async def on_message(self, event):
         """На каждую ссылку сразу «⏳ В очереди · ссылка», сообщение человека удаляется.
         Готово → видео, «⏳» удаляется (текст в видео Telegram превратить не даёт); ошибка → «⏳» → «❌».
@@ -612,9 +635,14 @@ class Bot:
         if event.chat_id != self.cfg["group_id"]:
             return
         text = event.raw_text or ""
-        if text.strip().lower().split("@")[0] == "/stop":
+        cmd = text.strip().lower().split("@")[0]
+        if cmd == "/stop":
             if event.sender_id == self.cfg["owner_id"]:
                 self.stopping.set()
+            return
+        if cmd == "/log":
+            if event.sender_id == self.cfg["owner_id"]:
+                await self.send_log(event)
             return
         topic, replied = self.where(event)
         if topic and topic == self.pick_topic and await self.on_pick(event, text, replied):
