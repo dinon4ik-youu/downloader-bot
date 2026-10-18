@@ -670,7 +670,7 @@ class Bot:
                                            top_msg_id=topic if reply_to and topic else None)
         markup = self.client.build_reply_markup(buttons) if buttons else None
         # в своих темах бот пишет беззвучно (просьба Димы 17.10.2026): мьютить тему за людей Telegram не даёт
-        silent = bool(topic) and topic in (self.pick_topic, self.done_topic)
+        silent = bool(topic) and (topic in (self.pick_topic, self.done_topic) or topic in self.link_topics)
         if media is None:
             req = functions.messages.SendMessageRequest(peer=self.peer, message=msg, entities=ent,
                                                         no_webpage=True, reply_to=rt, reply_markup=markup,
@@ -721,6 +721,51 @@ class Bot:
                 self.save()
                 log.info("создал тему «%s» → %s", title, have[title])
         self.pick_topic, self.done_topic = have[PICK_TOPIC], have[DONE_TOPIC]
+        # темы для ссылок на выплаты — только если заданы в config.json "link_topics" (у Димы, 18.10.2026)
+        for title in self.cfg.get("link_topics") or {}:
+            if title not in have:
+                upd = await self.client(functions.messages.CreateForumTopicRequest(peer=self.peer, title=title))
+                have[title] = next(u.id for u in upd.updates if hasattr(u, "id"))
+                self.save()
+                log.info("создал тему «%s» → %s", title, have[title])
+        self.link_topics = {have[t]: spec for t, spec in (self.cfg.get("link_topics") or {}).items()}
+
+    async def on_links(self, event, text, topic):
+        """Тема ссылок партнёрки: ссылки не качаем, а дописываем в её links.txt (дата<TAB>ссылка<TAB>sent|пусто),
+        тот же файл и формат, что у tg.py --links. "only": "instagram" — остальные ссылки не берём."""
+        spec = self.link_topics[topic]
+        path = Path(spec["dir"]) / "links.txt"
+        rows = [l.split("\t") for l in path.read_text(encoding="utf-8").splitlines() if l.strip()] \
+            if path.exists() else []
+        known = {r[1] for r in rows if len(r) > 1}
+        day = datetime.now().strftime("%Y-%m-%d")
+        new, dup, skip = [], 0, []
+        for url in re.findall(r"https?://\S+", text):
+            url = url.split("?")[0].rstrip("/") + "/"
+            if "instagram.com" in url:
+                url = url.replace("/reels/", "/reel/").replace("://instagram.com", "://www.instagram.com")
+            elif spec.get("only") == "instagram":
+                skip.append(url)
+                continue
+            if url in known:
+                dup += 1
+            else:
+                known.add(url)
+                new.append(url)
+        if new:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.writelines(f"{day}\t{u}\n" for u in new)
+            log.info("ссылки %s: +%d", path, len(new))
+        if not (new or dup or skip):
+            return
+        todo = sum(1 for r in rows if len(r) < 3 or r[2] != "sent") + len(new)
+        parts = [f"✅ записал {len(new)}"] if new else []
+        if dup:
+            parts.append(f"уже были: {dup}")
+        if skip:
+            parts.append(f"⚠️ не Instagram, не записал: {len(skip)}")
+        await self.send(" · ".join(parts) + f" · ждут выплаты: {todo}", topic=topic, reply_to=event.id)
 
     @staticmethod
     def where(event):
@@ -771,6 +816,9 @@ class Bot:
             return
         topic, replied = self.where(event)
         if topic and topic == self.pick_topic and await self.on_pick(event, text, replied):
+            return
+        if topic and topic in self.link_topics:
+            await self.on_links(event, text, topic)
             return
         jobs = parse_message(text)
         if not jobs:
@@ -1053,6 +1101,7 @@ class Bot:
         self.group = await self.client.get_entity(self.cfg["group_id"])
         self.peer = await self.client.get_input_entity(self.group)
         self.pick_topic = self.done_topic = None
+        self.link_topics = {}
         try:
             await self.ensure_topics()
         except Exception:
