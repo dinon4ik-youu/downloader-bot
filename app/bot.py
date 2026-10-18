@@ -34,6 +34,7 @@ import msvcrt
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -312,6 +313,24 @@ def update_ytdlp():
         log.info("yt-dlp -U: %s", (r.stdout + r.stderr).strip().splitlines()[-1:])
     except Exception as e:  # нет интернета и т.п. — работаем на старой
         log.warning("yt-dlp -U не вышло: %s", e)
+
+
+def wait_for_net():
+    """Автозапуск при входе в Windows бывает раньше, чем появился интернет: ждём сеть, а не падаем (18.10.2026)."""
+    said = False
+    while True:
+        try:
+            socket.create_connection(("api.telegram.org", 443), 5).close()
+            if said:
+                log.info("интернет появился")
+            return True
+        except OSError:
+            if not said:
+                log.info("нет интернета — жду")
+                said = True
+        if STOP_FLAG.exists():
+            return False
+        time.sleep(10)
 
 
 def warm_certs():
@@ -593,7 +612,8 @@ class Bot:
         from telethon import TelegramClient
         self.cfg = cfg
         tg = load_json(TG_CONFIG, {})
-        self.client = TelegramClient(str(SESSION), int(tg["api_id"]), tg["api_hash"], catch_up=True)
+        self.client = TelegramClient(str(SESSION), int(tg["api_id"]), tg["api_hash"], catch_up=True,
+                                     connection_retries=None, retry_delay=10)  # сеть пропала — ждать, а не выходить
         self.state = load_json(STATE, {"status_msg_id": None, "cache": {}})
         self.queue = asyncio.Queue()
         self.pick_queue = asyncio.Queue()  # сбор моментов стрима — отдельно, чтобы не держать качалку
@@ -1244,6 +1264,10 @@ def main():
     tmp = Path(cfg["tmp_dir"])
     shutil.rmtree(tmp, ignore_errors=True)  # остатки после сбоя
     tmp.mkdir(parents=True, exist_ok=True)
+    if not wait_for_net():
+        STOP_FLAG.unlink(missing_ok=True)
+        log.info("остановлен, пока ждал интернет")
+        return
     update_ytdlp()
     warm_certs()
     asyncio.run(Bot(cfg).main())
