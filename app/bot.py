@@ -630,6 +630,52 @@ def pillow():
     return Image, ImageDraw, ImageFont
 
 
+# Эмодзи (19.10.2026): в Montserrat их нет — были квадратики. Рисуем цветными из шрифта Windows.
+# Без raqm Pillow не склеивает последовательности: оттенок кожи, FE0F и всё после ZWJ отбрасываем —
+# остаётся базовый смайлик (👍🏻 → 👍, семья → первый человек).
+CR_EMOJI_FONT = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Fonts" / "seguiemj.ttf"
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF\u25A0-\u27BF"
+                      "\u2900-\u297F\u2B00-\u2BFF\u3030\u303D\u3297\u3299]")
+EMOJI_JUNK = re.compile("[\U0001F3FB-\U0001F3FF\uFE0E\uFE0F\u20E3]|(?:\u200D[^\s\u200D]+)+")
+
+
+class CaptionFont:
+    """Montserrat для текста + Segoe UI Emoji для смайликов: ширина и отрисовка строки по кускам."""
+
+    def __init__(self, ImageFont, size):
+        self.f = ImageFont.truetype(str(CR_FONT), size)
+        self.ef = ImageFont.truetype(str(CR_EMOJI_FONT), size) if CR_EMOJI_FONT.exists() else None
+        self.top, self.bottom = self.f.getbbox("Н")[1], self.f.getbbox("Н")[3]
+
+    def runs(self, s):
+        if not self.ef:
+            return [(s, False)]
+        out, last = [], 0
+        for m in EMOJI_RE.finditer(s):
+            if m.start() > last:
+                out.append((s[last:m.start()], False))
+            out.append((m[0], True))
+            last = m.end()
+        if last < len(s):
+            out.append((s[last:], False))
+        return out
+
+    def length(self, s):
+        return sum((self.ef if e else self.f).getlength(t) for t, e in self.runs(s))
+
+    def draw(self, d, x, y, s):
+        """y — верх заглавных букв строки."""
+        for t, e in self.runs(s):
+            if e:  # смайлик — по центру высоты заглавных
+                b = self.ef.getbbox(t)
+                d.text((x, y + (self.bottom - self.top) / 2 - (b[1] + b[3]) / 2), t, font=self.ef,
+                       embedded_color=True)
+                x += self.ef.getlength(t)
+            else:
+                d.text((x, y - self.top), t, font=self.f, fill=CR_YELLOW)
+                x += self.f.getlength(t)
+
+
 def wrap(text, font, maxw):
     """Слова по строкам в ширину maxw; переносы строк, которые написал человек, сохраняем."""
     lines = []
@@ -637,7 +683,7 @@ def wrap(text, font, maxw):
         cur = ""
         for w in para.split():
             t = f"{cur} {w}".strip()
-            if font.getlength(t) <= maxw or not cur:
+            if font.length(t) <= maxw or not cur:
                 cur = t
             else:
                 lines.append(cur)
@@ -649,24 +695,24 @@ def wrap(text, font, maxw):
 
 def caption_plate(text, path):
     Image, ImageDraw, ImageFont = pillow()
+    text = EMOJI_JUNK.sub("", text)
     text = "\n".join(" ".join(l.split()) for l in text.upper().splitlines() if l.strip())
     maxw = CR_W - 2 * 60 - 2 * CR_PADX
     size = CR_SIZE
     while True:
-        f = ImageFont.truetype(str(CR_FONT), size)
+        f = CaptionFont(ImageFont, size)
         lines = wrap(text, f, maxw)
-        if (len(lines) <= CR_MAX_LINES and all(f.getlength(l) <= maxw for l in lines)) or size <= CR_MIN:
+        if (len(lines) <= CR_MAX_LINES and all(f.length(l) <= maxw for l in lines)) or size <= CR_MIN:
             break
         size -= 3
-    top, bottom = f.getbbox("Н")[1], f.getbbox("Н")[3]
     lh = round(size * 1.22)
-    pw = round(max(f.getlength(l) for l in lines) + 2 * CR_PADX)
-    ph = round(bottom - top + (len(lines) - 1) * lh + 2 * CR_PADY)
+    pw = round(max(f.length(l) for l in lines) + 2 * CR_PADX)
+    ph = round(f.bottom - f.top + (len(lines) - 1) * lh + 2 * CR_PADY)
     im = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
     d.rounded_rectangle((0, 0, pw - 1, ph - 1), radius=CR_RADIUS, fill=CR_PLATE)
     for i, l in enumerate(lines):
-        d.text(((pw - f.getlength(l)) / 2, CR_PADY + i * lh - top), l, font=f, fill=CR_YELLOW)
+        f.draw(d, (pw - f.length(l)) / 2, CR_PADY + i * lh, l)
     im.save(path)
 
 
