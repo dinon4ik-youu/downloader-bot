@@ -507,6 +507,17 @@ def stream_link(url):
     return None
 
 
+def link_start(raw):
+    """?t= в ссылке на запись («Поделиться → Начало 23:28» на Kick; Twitch: ?t=1h6m55s) → секунды или None."""
+    t = parse_qs(urlsplit(raw.split()[0] if raw.strip() else "").query).get("t", [""])[0].strip().lower()
+    if t.isdigit():
+        return int(t)
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", t)
+    if t and m:
+        return int(m[1] or 0) * 3600 + int(m[2] or 0) * 60 + int(m[3] or 0)
+    return None
+
+
 def stream_moments(site, channel, rec):
     """→ (стрим, число клипов, моменты от самых заклипанных). Блокирующая — гоняется в потоке."""
     if site == "twitch":
@@ -1098,14 +1109,16 @@ class Bot:
         if t in ("ещё", "еще", "/more", "more"):
             await self.pick_queue.put({"kind": "more", "reply_to": event.id})
             return True
-        for url, cut, _q, _o in parse_message(text):
+        for url, cut, quote, _o in parse_message(text):
             k = stream_link(url)
             if k and not cut:
                 wait = "до ~5 мин" if k[0] == "kick" else "до минуты"
-                ph = await self.send(f"⏳ Собираю клипы стрима · {link(url)}\nпервый раз — {wait}",
+                frm = link_start(quote) if k[2] else None  # ?t= — только моменты с этого места записи
+                ph = await self.send(f"⏳ Собираю клипы стрима · {link(url)}"
+                                     + (f" · с {hms(frm)}" if frm else "") + f"\nпервый раз — {wait}",
                                      topic=self.pick_topic, reply_to=event.id)
                 await self.pick_queue.put({"kind": "stream", "site": k[0], "channel": k[1], "uuid": k[2],
-                                           "url": url, "ph": ph.id})
+                                           "url": url, "ph": ph.id, "from": frm})
                 return True
         return False  # прочие ссылки — обычной качалкой, ответ в этой же теме
 
@@ -1117,12 +1130,16 @@ class Bot:
                 if job["kind"] == "stream":
                     site = job.get("site", "kick")
                     s, total, moments = await asyncio.to_thread(stream_moments, site, job["channel"], job["uuid"])
+                    frm = job.get("from")
+                    if frm:
+                        moments = [m for m in moments if m["punch"] >= frm]
                     self.state["pick"] = {"site": site, "channel": s.get("login") or job["channel"],
                                           "title": s["title"], "start": s["start"],
                                           "moments": moments, "next": 0}
                     self.save()
                     await self.edit(job["ph"], f"📺 <b>{esc(s['title'])}</b> · {s['start'][:10]} · "
-                                               f"{link(job['url'])}\nклипов {total} → моментов {len(moments)}, "
+                                               f"{link(job['url'])}\nклипов {total} → моментов {len(moments)}"
+                                               + (f" с {hms(frm)}" if frm else "") + ", "
                                                f"самые заклипанные первыми"
                                                + ("\nзаписи у канала нет — моменты по времени создания "
                                                   "клипов, время примерное" if s.get("approx") else ""))
