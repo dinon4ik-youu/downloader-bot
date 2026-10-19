@@ -1192,6 +1192,12 @@ class Bot:
                         buttons=[Button.inline(f"➡️ Ещё {min(PICK_BATCH, left)}", b"more")] if left else None)
         return n
 
+    def stream_hint(self, url, pick):
+        """Целый стрим кинули не в ту тему (обычно в General) — подсказать, куда за клипами."""
+        if pick or not self.pick_topic or not stream_link(url):
+            return ""
+        return f" (если вы хотите получить клипы со стрима, то это нужно в другую ветку скидывать: «{PICK_TOPIC}»)"
+
     async def worker(self):
         from telethon import utils
         n = 0
@@ -1245,7 +1251,7 @@ class Bot:
                 await asyncio.to_thread(self.copy_out, out, p["streamer"], cut, "_creative" if text else "")
                 log.info("готово %s → %s", key, sent.id)
             except JobError as e:
-                await self.edit(ph, f"❌ Не скачал: {esc(str(e))} · {link(url)}")
+                await self.edit(ph, f"❌ Не скачал: {esc(str(e))}{self.stream_hint(url, pick)} · {link(url)}")
                 if "Instagram" in str(e):
                     await self.tell_owner(
                         "Instagram перестал пускать без входа — ссылки с Instagram сейчас не скачиваются. "
@@ -1254,7 +1260,8 @@ class Bot:
                         "аккаунты (этап 2 в notes/plans.md, файл accounts/instagram-bot-pool.txt).")
             except Exception:
                 log.exception("сбой на %s", key)
-                await self.edit(ph, f"❌ Не скачал, {OWNER} посмотрит · {link(url)}")
+                hint = self.stream_hint(url, pick)
+                await self.edit(ph, f"❌ Не скачал, {OWNER} {'решит' + hint if hint else 'посмотрит'} · {link(url)}")
             finally:
                 self.busy = 0
                 shutil.rmtree(work, ignore_errors=True)
