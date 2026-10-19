@@ -20,7 +20,10 @@
   «Выбор клипов»  ссылка на запись стрима Kick или Twitch (или на канал = последний стрим) → 10 моментов: превью
                   главного клипа в 360p + ссылка на длинный клип с панчем посередине; «ещё» — следующие 10.
                   Ответ на превью: «ок» / «+» — целиком, или обрезка как выше (-1 -5, до 20…) →
-                  клип в полном качестве уходит в «Отобранные». Моменты — tools/kick_clips.py, twitch_clips.py.
+                  клип в полном качестве уходит в «Отобранные». Ответ текстом («суд над гамосом», можно после
+                  обрезки: «-1 -5 суд над гамосом») — вместо клипа в «Отобранные» уходит креатив 9:16: клип в
+                  центре, сверху и снизу размытый он же, текст — жёлтая подпись на тёмной плашке (make_creative).
+                  Моменты — tools/kick_clips.py, twitch_clips.py.
   остальные       обычная качалка, ответ в той же теме.
 
 Секреты (не пересылать, в bgswap-kit не класть): tools/shared-bot-token.txt,
@@ -118,7 +121,8 @@ HINT = ("<b>Как пользоваться</b>\n"
         "kick.com/…/videos/BBB 1:20:00-1:20:10</pre>\n"
         "<b>Выбор клипов</b>: ссылка на запись стрима Kick или Twitch → превью моментов. Кнопка «✅ Беру целиком» "
         "под превью (или ответ «ок») — клип в «Отобранные»; с обрезкой — ответь на превью: "
-        "<code>-1 -5</code>, <code>до 20</code>. «➡️ Ещё» — следующие моменты.")
+        "<code>-1 -5</code>, <code>до 20</code>. Ответь на превью текстом — придёт готовый креатив 9:16 с этой "
+        "подписью (можно с обрезкой: <code>-1 -5 суд над гамосом</code>). «➡️ Ещё» — следующие моменты.")
 
 URL_RE = re.compile(
     r"(https?://\S+|(?:www\.)?(?:kick\.com|(?:vm\.|vt\.)?tiktok\.com|instagram\.com|youtube\.com|"
@@ -189,6 +193,27 @@ def parse_cut(rest):
     if m:
         return {"start": secs(m[1]), "tail": secs(m[2]) if m[2] else 0.0}
     raise CutError(f"не понял «{rest.strip()}»")
+
+
+CUT_HEAD = re.compile(rf"\s*(?:{TIME}\s*[-—–]\s*{TIME}|до\s*{TIME}|[-—–]\s*{TIME}(?:\s+[-—–]\s*{TIME})?)(?=\s|$)",
+                      re.I)
+
+
+def parse_reply(text):
+    """Ответ на превью → (cut, подпись | None). «ок» — целиком; «-1 -5» — обрезка; «-1 -5 текст» или просто
+    «текст» — креатив с этой подписью. Обрезка не разобралась («5-0 в нашу пользу») — весь текст подпись."""
+    if text.strip().lower() in OK_WORDS:
+        return {}, None
+    m = CUT_HEAD.match(text)
+    if m:
+        try:
+            cut = parse_cut(m[0])
+        except CutError:
+            if not text[m.end():].strip():
+                raise  # «1:75-2» без текста — опечатка в обрезке, а не подпись
+            return {}, text.strip()
+        return cut, text[m.end():].strip() or None
+    return {}, text.strip()
 
 
 def norm_url(u):
@@ -578,6 +603,99 @@ def preview_done(prev, work):
     return prev, q
 
 
+# ---------- классический креатив (19.10.2026) ----------
+# Вертикаль 1080×1920: клип по ширине в центре, сверху и снизу — его же размытая копия, над клипом —
+# подпись жёлтым капсом на тёмной скруглённой плашке (стиль «криатор фаба» LevelX, «Суд над Гамосом»).
+
+CR_W, CR_H = 1080, 1920
+CR_FONT = HERE / "Montserrat-ExtraBold.ttf"
+CR_SIZE, CR_MIN = 65, 40       # кегль: 65 — как в образце; длинную подпись уменьшаем до 40
+CR_MAX_LINES = 3
+CR_PADX, CR_PADY, CR_RADIUS = 40, 44, 22
+CR_YELLOW, CR_PLATE = (236, 222, 30, 255), (28, 26, 30, 225)
+CR_GAP = 95                    # от низа плашки до верха клипа
+
+
+def pillow():
+    """Pillow для плашки. В наборе его нет (install.ps1 у старых установок не обновляется) — ставим сами."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        log.info("ставлю Pillow")
+        r = run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", "pillow"], 600)
+        if r.returncode != 0:
+            log.error("pip pillow: %s", r.stderr[-1000:])
+            raise JobError(f"не поставил Pillow для подписи, {OWNER} посмотрит")
+        from PIL import Image, ImageDraw, ImageFont
+    return Image, ImageDraw, ImageFont
+
+
+def wrap(text, font, maxw):
+    """Слова по строкам в ширину maxw; переносы строк, которые написал человек, сохраняем."""
+    lines = []
+    for para in text.splitlines():
+        cur = ""
+        for w in para.split():
+            t = f"{cur} {w}".strip()
+            if font.getlength(t) <= maxw or not cur:
+                cur = t
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+    return lines
+
+
+def caption_plate(text, path):
+    Image, ImageDraw, ImageFont = pillow()
+    text = "\n".join(" ".join(l.split()) for l in text.upper().splitlines() if l.strip())
+    maxw = CR_W - 2 * 60 - 2 * CR_PADX
+    size = CR_SIZE
+    while True:
+        f = ImageFont.truetype(str(CR_FONT), size)
+        lines = wrap(text, f, maxw)
+        if (len(lines) <= CR_MAX_LINES and all(f.getlength(l) <= maxw for l in lines)) or size <= CR_MIN:
+            break
+        size -= 3
+    top, bottom = f.getbbox("Н")[1], f.getbbox("Н")[3]
+    lh = round(size * 1.22)
+    pw = round(max(f.getlength(l) for l in lines) + 2 * CR_PADX)
+    ph = round(bottom - top + (len(lines) - 1) * lh + 2 * CR_PADY)
+    im = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.rounded_rectangle((0, 0, pw - 1, ph - 1), radius=CR_RADIUS, fill=CR_PLATE)
+    for i, l in enumerate(lines):
+        d.text(((pw - f.getlength(l)) / 2, CR_PADY + i * lh - top), l, font=f, fill=CR_YELLOW)
+    im.save(path)
+
+
+def make_creative(src, text, work):
+    """Скачанный клип + подпись → вертикальный креатив. → (путь, сведения как у process)."""
+    plate, out = work / "plate.png", work / "creative.mp4"
+    caption_plate(text, plate)
+    p = probe(src)
+    fg_h = round(CR_W * p["h"] / p["w"] / 2) * 2
+    # фон: уменьшить → размыть → растянуть обратно (в разы быстрее, чем размывать 1080×1920)
+    fc = (f"[0:v]split[a][b];"
+          f"[a]scale={CR_W // 4}:{CR_H // 4}:force_original_aspect_ratio=increase,crop={CR_W // 4}:{CR_H // 4},"
+          f"boxblur=10:2,scale={CR_W}:{CR_H},eq=brightness=-0.06,setsar=1[bg];"
+          f"[b]scale={CR_W}:{fg_h},setsar=1[fg];"
+          f"[bg][fg]overlay=0:(H-h)/2[v0];"
+          f"[v0][1:v]overlay=(W-w)/2:'max(40,(H-{fg_h})/2-{CR_GAP}-h)'[v]")
+    r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-i", plate, "-filter_complex", fc,
+             "-map", "[v]", "-map", "0:a?", *ENC, out], 1800)
+    if r.returncode != 0 or not out.exists():
+        log.error("ffmpeg креатив: %s", r.stderr[-2000:])
+        raise JobError(f"не собрал креатив, {OWNER} посмотрит")
+    q = probe(out)
+    thumb = work / "creative.jpg"
+    run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{min(1, q['duration'] / 2):.2f}",
+         "-i", out, "-frames:v", "1", "-vf", "scale=-2:480", thumb], 60)
+    q["thumb"] = thumb if thumb.exists() else None
+    return out, q
+
+
 # ---------- Telegram ----------
 
 def esc(s):
@@ -832,16 +950,18 @@ class Bot:
                 await self.queue.put({"ph": ph.id, "url": url, "cut": cut, "topic": topic})
         await self.delete(event.id)
 
-    async def take(self, pick_msg, cut, sender_id, sender, reply_to):
-        """Превью выбрано (ответом или кнопкой) → в очередь: полное качество в «Отобранные»."""
+    async def take(self, pick_msg, cut, sender_id, sender, reply_to, caption=None):
+        """Превью выбрано (ответом или кнопкой) → в очередь: полное качество в «Отобранные».
+        С подписью — сразу вертикальный креатив (make_creative)."""
         pick = self.state["picks"][str(pick_msg)]
         who = self.cfg["owner_name"] if sender_id == self.cfg["owner_id"] else (
             getattr(sender, "first_name", None) or getattr(sender, "username", None) or "кто-то")
         wait = self.queue.qsize() + self.busy
-        ph = await self.send(f"⏳ В очереди{f': {wait + 1}' if wait else ''} · {cut_label(cut)}",
+        what = f"креатив «{esc(caption)}» · " if caption else ""
+        ph = await self.send(f"⏳ В очереди{f': {wait + 1}' if wait else ''} · {what}{cut_label(cut)}",
                              topic=self.pick_topic, reply_to=reply_to)
         await self.queue.put({"ph": ph.id, "url": pick["url"], "cut": cut, "topic": self.done_topic,
-                              "pick": pick, "pick_msg": pick_msg, "who": who})
+                              "pick": pick, "pick_msg": pick_msg, "who": who, "caption": caption})
 
     async def on_button(self, event):
         """Кнопка «✅ Беру целиком» под превью."""
@@ -872,17 +992,15 @@ class Bot:
         """Тема «Выбор клипов». → True, если сообщение разобрано здесь."""
         t = text.strip().lower()
         picks = self.state.setdefault("picks", {})
-        if replied and str(replied) in picks:  # ответ на превью: «ок» или обрезка
-            if t in OK_WORDS:
-                cut = {}
-            else:
-                try:
-                    cut = parse_cut(text)
-                except CutError as e:
-                    await self.send(f"❌ {esc(str(e))} — пример: «ок», «-1 -5», «до 20»",
-                                    topic=self.pick_topic, reply_to=event.id)
-                    return True
-            await self.take(replied, cut, event.sender_id, await event.get_sender(), reply_to=event.id)
+        if replied and str(replied) in picks:  # ответ на превью: «ок», обрезка, подпись → креатив
+            try:
+                cut, caption = parse_reply(text)
+            except CutError as e:
+                await self.send(f"❌ {esc(str(e))} — пример: «ок», «-1 -5», «до 20», «-1 -5 подпись»",
+                                topic=self.pick_topic, reply_to=event.id)
+                return True
+            await self.take(replied, cut, event.sender_id, await event.get_sender(), reply_to=event.id,
+                            caption=caption)
             return True
         if t in ("ещё", "еще", "/more", "more"):
             await self.pick_queue.put({"kind": "more", "reply_to": event.id})
@@ -974,7 +1092,8 @@ class Bot:
             self.save()
         left = len(moments) - st["next"]
         await self.send(f"«✅ Беру целиком» под превью — клип уйдёт в «{DONE_TOPIC}»; "
-                        f"обрезать — ответь на превью: «-1 -5», «до 20».\n"
+                        f"обрезать — ответь на превью: «-1 -5», «до 20»; креатив 9:16 с подписью — ответь "
+                        f"текстом подписи (можно после обрезки: «-1 -5 текст»).\n"
                         + (f"Осталось моментов: {left}" if left else "Это все моменты стрима."),
                         topic=self.pick_topic,
                         buttons=[Button.inline(f"➡️ Ещё {min(PICK_BATCH, left)}", b"more")] if left else None)
@@ -1004,24 +1123,33 @@ class Bot:
                         continue
                 await self.edit(ph, f"⏳ В работе · {link(url)}")
                 out, p = await asyncio.to_thread(process, url, cut, self.cfg, work)
+                text = job.get("caption")  # подпись → классический креатив
+                if text:
+                    await self.edit(ph, f"⏳ Собираю креатив · {link(url)}")
+                    streamer = p["streamer"]
+                    out, p = await asyncio.to_thread(make_creative, out, text, work)
+                    p["streamer"] = streamer
                 await self.edit(ph, f"⏳ Отправляю · {link(url)}")
                 q = f"{p['h']}p{round(p['fps'])}" if p["fps"] >= 50 else f"{p['h']}p"
                 caption = f"{esc(p['streamer'])} · {cut_label(cut)} · {q} · {link(url)}"
                 if pick:
                     caption = (f"{esc(pick['title'])}\nпанч {hms(pick['punch'])} · заклипали {pick['n']} раз · "
                                f"выбрал {esc(job['who'])}\n{caption} · {link(pick['long'], 'длинный')}")
+                if text:
+                    caption = f"🎬 креатив «{esc(text)}»\n{caption}"
                 media = video_media(await self.client.upload_file(str(out)),
                                     await self.client.upload_file(str(p["thumb"])) if p["thumb"] else None,
                                     p, p["streamer"])
                 sent = await self.send(caption, media, topic=topic)
                 if pick:
-                    await self.edit(ph, f"✅ в «{DONE_TOPIC}» · {cut_label(cut)} · {esc(job['who'])}")
+                    what = "креатив · " if text else ""
+                    await self.edit(ph, f"✅ в «{DONE_TOPIC}» · {what}{cut_label(cut)} · {esc(job['who'])}")
                     await self.edit(job["pick_msg"], f"✅ выбрал {esc(job['who'])}\n{pick['caption']}")
                 else:
                     await self.delete(ph)
                     self.state["cache"][key] = sent.id
                     self.save()
-                await asyncio.to_thread(self.copy_out, out, p["streamer"], cut)
+                await asyncio.to_thread(self.copy_out, out, p["streamer"], cut, "_creative" if text else "")
                 log.info("готово %s → %s", key, sent.id)
             except JobError as e:
                 await self.edit(ph, f"❌ Не скачал: {esc(str(e))} · {link(url)}")
@@ -1040,7 +1168,7 @@ class Bot:
                 if pick and job["pick_msg"] in self.state.get("taking", []):
                     self.state["taking"].remove(job["pick_msg"])  # кнопку можно нажать снова, если сбой
 
-    def copy_out(self, out, streamer, cut):
+    def copy_out(self, out, streamer, cut, suffix=""):
         d = Path(self.cfg["out_dir"])
         d.mkdir(parents=True, exist_ok=True)
         f = lambda x: tc(x).replace(":", "-")
@@ -1052,7 +1180,7 @@ class Bot:
             lbl = f"minus{cut.get('start', 0):g}s_{cut.get('tail', 0):g}s"
         else:
             lbl = "full"
-        base = f"{streamer}_{datetime.now():%Y-%m-%d}_{lbl}"
+        base = f"{streamer}_{datetime.now():%Y-%m-%d}_{lbl}{suffix}"
         dst, i = d / f"{base}.mp4", 2
         while dst.exists():
             dst, i = d / f"{base}_{i}.mp4", i + 1
