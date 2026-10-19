@@ -617,7 +617,11 @@ CR_GAP = 95                    # от низа плашки до верха кл
 
 
 def pillow():
-    """Pillow для плашки. В наборе его нет (install.ps1 у старых установок не обновляется) — ставим сами."""
+    """Pillow для плашки. В наборе его нет (install.ps1 у старых установок не обновляется) — ставим сами.
+    raqm (склейка эмодзи: 👍🏻, семьи) в Pillow вшит, но ищет fribidi через PATH — DLL лежит рядом с bot.py
+    (libfribidi-0.dll из MSYS2, LGPL)."""
+    if str(HERE) not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = str(HERE) + os.pathsep + os.environ.get("PATH", "")
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
@@ -631,18 +635,39 @@ def pillow():
 
 
 # Эмодзи (19.10.2026): в Montserrat их нет — были квадратики. Рисуем цветными из шрифта Windows.
-# Без raqm Pillow не склеивает последовательности: оттенок кожи, FE0F и всё после ZWJ отбрасываем —
-# остаётся базовый смайлик (👍🏻 → 👍, семья → первый человек).
+# Склейки (👍🏻, семья через ZWJ, флаги) собирает raqm — смайлик целиком одним куском. Если raqm не поднялся
+# (нет fribidi) — оттенок кожи, FE0F и всё после ZWJ отбрасываем: остаётся базовый смайлик.
 CR_EMOJI_FONT = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Fonts" / "seguiemj.ttf"
-EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF\u25A0-\u27BF"
-                      "\u2900-\u297F\u2B00-\u2BFF\u3030\u303D\u3297\u3299]")
+_EMO = ("[\U0001F000-\U0001F1E5\U0001F200-\U0001FAFF\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF\u25A0-\u27BF"
+        "\u2900-\u297F\u2B00-\u2BFF\u3030\u303D\u3297\u3299]")
+_MOD = "[\U0001F3FB-\U0001F3FF\uFE0F\U000E0020-\U000E007F]"  # оттенок кожи, «как смайлик», теги флагов
+EMOJI_RE = re.compile(f"[\U0001F1E6-\U0001F1FF]{{2}}|[0-9#*]\uFE0F?\u20E3|{_EMO}{_MOD}*(?:\u200D{_EMO}{_MOD}*)*")
+# \u0444\u043B\u0430\u0433\u043E\u0432 \u0441\u0442\u0440\u0430\u043D \u0432 Segoe UI Emoji \u043D\u0435\u0442 (Windows \u0440\u0438\u0441\u0443\u0435\u0442 \u00ABUA\u00BB) \u2014 \u0431\u0435\u0440\u0451\u043C \u043A\u0430\u0440\u0442\u0438\u043D\u043A\u0443 Twemoji, \u043A\u044D\u0448 \u0440\u044F\u0434\u043E\u043C \u0441 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u043C\u0438
+FLAG_URL = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/{}.png"
+FLAG_CACHE = DATA / "emoji_cache"
+
+
+def flag_image(Image, t):
+    code = "-".join(f"{ord(c):x}" for c in t)
+    p = FLAG_CACHE / f"{code}.png"
+    if not p.exists():
+        try:
+            FLAG_CACHE.mkdir(exist_ok=True)
+            with urllib.request.urlopen(FLAG_URL.format(code), timeout=15) as r:
+                p.write_bytes(r.read())
+        except OSError as e:
+            log.warning("\u0444\u043B\u0430\u0433 %s \u043D\u0435 \u0441\u043A\u0430\u0447\u0430\u043B\u0441\u044F: %s", t, e)
+            return None
+    return Image.open(p).convert("RGBA")
 EMOJI_JUNK = re.compile("[\U0001F3FB-\U0001F3FF\uFE0E\uFE0F\u20E3]|(?:\u200D[^\s\u200D]+)+")
 
 
 class CaptionFont:
     """Montserrat для текста + Segoe UI Emoji для смайликов: ширина и отрисовка строки по кускам."""
 
-    def __init__(self, ImageFont, size):
+    def __init__(self, Image, ImageFont, size):
+        self.Image, self.size = Image, size
+        self.flags = {}
         self.f = ImageFont.truetype(str(CR_FONT), size)
         self.ef = ImageFont.truetype(str(CR_EMOJI_FONT), size) if CR_EMOJI_FONT.exists() else None
         self.top, self.bottom = self.f.getbbox("Н")[1], self.f.getbbox("Н")[3]
@@ -660,13 +685,32 @@ class CaptionFont:
             out.append((s[last:], False))
         return out
 
-    def length(self, s):
-        return sum((self.ef if e else self.f).getlength(t) for t, e in self.runs(s))
+    def flag(self, t):
+        """Флаг страны картинкой Twemoji под размер шрифта (None — не флаг или не скачался)."""
+        if not "\U0001F1E6" <= t[0] <= "\U0001F1FF":
+            return None
+        if t not in self.flags:
+            im = flag_image(self.Image, t)
+            self.flags[t] = im and im.resize((self.size, self.size), self.Image.LANCZOS)
+        return self.flags[t]
 
-    def draw(self, d, x, y, s):
+    def width(self, t, e):
+        if e and self.flag(t):
+            return self.size * 1.08
+        return (self.ef if e else self.f).getlength(t)
+
+    def length(self, s):
+        return sum(self.width(t, e) for t, e in self.runs(s))
+
+    def draw(self, im, d, x, y, s):
         """y — верх заглавных букв строки."""
         for t, e in self.runs(s):
-            if e:  # смайлик — по центру высоты заглавных
+            fl = e and self.flag(t)
+            if fl:
+                im.alpha_composite(fl, (round(x + self.size * 0.04),
+                                        round(y + (self.bottom - self.top - self.size) / 2)))
+                x += self.width(t, e)
+            elif e:  # смайлик — по центру высоты заглавных
                 b = self.ef.getbbox(t)
                 d.text((x, y + (self.bottom - self.top) / 2 - (b[1] + b[3]) / 2), t, font=self.ef,
                        embedded_color=True)
@@ -695,12 +739,15 @@ def wrap(text, font, maxw):
 
 def caption_plate(text, path):
     Image, ImageDraw, ImageFont = pillow()
-    text = EMOJI_JUNK.sub("", text)
+    from PIL import features
+    if not features.check("raqm"):
+        log.warning("raqm не поднялся (нет libfribidi-0.dll?) — склейки эмодзи упрощаю")
+        text = EMOJI_JUNK.sub("", text)
     text = "\n".join(" ".join(l.split()) for l in text.upper().splitlines() if l.strip())
     maxw = CR_W - 2 * 60 - 2 * CR_PADX
     size = CR_SIZE
     while True:
-        f = CaptionFont(ImageFont, size)
+        f = CaptionFont(Image, ImageFont, size)
         lines = wrap(text, f, maxw)
         if (len(lines) <= CR_MAX_LINES and all(f.length(l) <= maxw for l in lines)) or size <= CR_MIN:
             break
@@ -712,7 +759,7 @@ def caption_plate(text, path):
     d = ImageDraw.Draw(im)
     d.rounded_rectangle((0, 0, pw - 1, ph - 1), radius=CR_RADIUS, fill=CR_PLATE)
     for i, l in enumerate(lines):
-        f.draw(d, (pw - f.length(l)) / 2, CR_PADY + i * lh, l)
+        f.draw(im, d, (pw - f.length(l)) / 2, CR_PADY + i * lh, l)
     im.save(path)
 
 
