@@ -109,6 +109,9 @@ PICK_BATCH = 10           # моментов за раз
 PICK_MIN_CLIPS = 2        # момент, который заклипали один раз, — не показываем
 KICK_CACHE_MAX_H = 1      # сохранённые клипы стрима старше часа — собрать заново (клипы ещё добавляются)
 OK_WORDS = {"ок", "ok", "+", "да", "беру", "👍"}
+EDITS_REPLY_RE = re.compile(r"^(\d{1,2}|повтори|стоп)$")  # ответы прогону Edits на iPhone
+EDITS_WORDS = {"edits", "в edits", "эдитс", "едитс", "📱"}  # ответ на видео в «Отобранных» → прогнать через Edits
+EDITS_GATHER_S = 20       # айфон свободен — подождать ещё нажатий столько секунд после последнего, потом пачкой
 
 HINT = ("<b>Как пользоваться</b>\n"
         "Ссылка — видео целиком. Обрезка — на той же строке после ссылки:\n"
@@ -152,6 +155,17 @@ def load_config():
     c.update(load_json(CONFIG, {}))
     if not c["owner_id"]:
         c["owner_id"] = load_json(TG_CONFIG, {}).get("chat_id")
+    if c.get("edits_topic") is not None:  # айфон + Edits включены — недостающее по умолчанию (21.10.2026, для набора)
+        titles = {"title": "Прогон Edits", "ask_title": "Вопросы прогона", "drop_title": "Кинуть в Edits"}
+        if not c["edits_topic"]:  # install-iphone.ps1 пишет {} — названия тем в файл: их читают скрипты айфона
+            raw = load_json(CONFIG, {})
+            raw["edits_topic"] = c["edits_topic"] = dict(titles)
+            save_json(CONFIG, raw)
+        wda = (HERE / "wda") if KIT else (TOOLS / "wda")
+        wdata = (DATA / "wda") if KIT else wda
+        et = {**titles, "script": str(wda / "edits_iphone.py"), "jobs_dir": str(ROOT / "edits-jobs"),
+              "replies": str(wdata / "replies.txt"), "data_dir": str(wdata), **c["edits_topic"]}
+        c["edits_topic"] = et
     if not CONFIG.exists():
         save_json(CONFIG, c)
     return c
@@ -593,13 +607,22 @@ def make_preview(clip_id, work, site="kick"):
     prev = work / "preview.mp4"
     enc = ["-vf", "scale=-2:360", "-c:v", "libx264", "-crf", "30", "-preset", "veryfast", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", prev]
-    r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", *FF_TLS, "-i", m3u8, *enc], 600)
-    if (r.returncode != 0 or not prev.exists()) and "certificate" in r.stderr:
+    try:  # обычно 10–20 с; ffmpeg бывает виснет на плейлисте Kick насовсем (21.10.2026) — тогда качаем сами
+        r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", *FF_TLS, "-i", m3u8, *enc], 120)
+        hung = False
+    except subprocess.TimeoutExpired:
+        log.warning("превью: ffmpeg завис на плейлисте, качаю куски сам")
+        hung = True
+    if hung or (r.returncode != 0 or not prev.exists()) and "certificate" in r.stderr:
         # -ca_file не доходит до кусков .ts внутри плейлиста — качаем их сами (urllib + certifi)
-        log.info("превью: ffmpeg не доверяет сертификату, качаю куски сам")
+        if not hung:
+            log.info("превью: ffmpeg не доверяет сертификату, качаю куски сам")
         ts = work / "clip.ts"
-        fetch_hls(m3u8, ts)
-        r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", ts, *enc], 600)
+        try:
+            fetch_hls(m3u8, ts)
+            r = run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", ts, *enc], 120)
+        except (OSError, subprocess.TimeoutExpired):
+            raise JobError("Kick не отдал видео вовремя")
     if r.returncode != 0 or not prev.exists():
         log.error("превью: %s", r.stderr[-1000:])
         raise JobError("не сделал превью")
@@ -820,6 +843,34 @@ def ms(sec):
     return f"{sec // 60}:{sec % 60:02d}"
 
 
+def is_video(msg):
+    return bool(msg.video or (msg.document and (msg.file.mime_type or "").startswith("video/")))
+
+
+def msg_topic(msg):
+    """Тема сообщения форума (id корня темы) или None."""
+    r = msg.reply_to
+    if not (r and getattr(r, "forum_topic", False)):
+        return None
+    return r.reply_to_top_id or r.reply_to_msg_id
+
+
+def is_vertical(msg):
+    """Видео 9:16 (выше, чем шире). Размеров нет (прислали файлом без атрибутов) — считаем вертикальным."""
+    w, h = getattr(msg.file, "width", None), getattr(msg.file, "height", None)
+    return not (w and h) or h > w
+
+
+def CANCEL_BTN():  # noqa: N802 — под «⏳ В очереди / В работе» (20.10.2026, идея из Downloader-ботов на GitHub)
+    from telethon import Button
+    return [Button.inline("✖️ Отмена", b"cancel")]
+
+
+def EDITS_BTN():  # noqa: N802 — кнопка под вертикальным видео в «Отобранных»
+    from telethon import Button
+    return [Button.inline("📱 Прогнать через Edits", b"edits")]
+
+
 def video_media(client_file, thumb_file, p, name):
     from telethon.tl import types
     return types.InputMediaUploadedDocument(
@@ -843,6 +894,9 @@ class Bot:
         self.since = datetime.now()
         self.group = None
         self.stopping = asyncio.Event()
+        self.edits_last = 0  # время последнего нажатия «в Edits» (ждущие — в state["edits_pending"])
+        self.cancelled = set()  # «⏳»-сообщения, под которыми нажали «✖️ Отмена» — worker их пропускает
+        self.inflight = {}  # ключ ссылки+обрезки → «⏳» уже в очереди/в работе: вторая такая же не встаёт в очередь
 
     def save(self):
         save_json(STATE, self.state)
@@ -892,7 +946,8 @@ class Bot:
                                            top_msg_id=topic if reply_to and topic else None)
         markup = self.client.build_reply_markup(buttons) if buttons else None
         # в своих темах бот пишет беззвучно (просьба Димы 17.10.2026): мьютить тему за людей Telegram не даёт
-        silent = bool(topic) and (topic in (self.pick_topic, self.done_topic) or topic in self.link_topics)
+        silent = bool(topic) and (topic in (self.pick_topic, self.done_topic, self.drop_topic)
+                                  or topic in self.link_topics)
         if media is None:
             req = functions.messages.SendMessageRequest(peer=self.peer, message=msg, entities=ent,
                                                         no_webpage=True, reply_to=rt, reply_markup=markup,
@@ -903,13 +958,16 @@ class Bot:
         res = await self.client(req)
         return self.client._get_response_message(req, res, self.peer)
 
-    async def edit(self, msg_id, text):
+    async def edit(self, msg_id, text, buttons=None):
+        """Правка текста; кнопки без buttons Telegram снимает."""
         from telethon.extensions import html as tg_html
         from telethon.tl import functions
         msg, ent = tg_html.parse(text)
+        markup = self.client.build_reply_markup(buttons) if buttons else None
         try:
             await self.client(functions.messages.EditMessageRequest(peer=self.peer, id=msg_id, message=msg,
-                                                                    entities=ent, no_webpage=True))
+                                                                    entities=ent, no_webpage=True,
+                                                                    reply_markup=markup))
         except Exception as e:
             log.warning("не отредактировал %s: %s", msg_id, e)
 
@@ -951,6 +1009,42 @@ class Bot:
                 self.save()
                 log.info("создал тему «%s» → %s", title, have[title])
         self.link_topics = {have[t]: spec for t, spec in (self.cfg.get("link_topics") or {}).items()}
+        # тема прогона через Edits на iPhone — только если задана в config.json "edits_topic" (у Димы, 19.10.2026)
+        # «ask_title» — отдельная тема для вопросов прогона (20.10.2026): в «Прогон Edits» только файлы, иначе
+        # вопросы и ответы сдвигают чат, который в этот момент открыт на айфоне, и нажатие мажет
+        et = self.cfg.get("edits_topic")
+        # «drop_title» — тема, куда кидают свои креативы прогнать через Edits (20.10.2026)
+        titles = [x for x in (et["title"], et.get("ask_title")) if x] if et else []
+        for title in titles + ([et["drop_title"]] if et and et.get("drop_title") else []):
+            if title not in have:
+                upd = await self.client(functions.messages.CreateForumTopicRequest(peer=self.peer, title=title))
+                have[title] = next(u.id for u in upd.updates if hasattr(u, "id"))
+                self.save()
+                log.info("создал тему «%s» → %s", title, have[title])
+                if title == et.get("drop_title"):
+                    self.drop_topic = have[title]
+                    await self.send("Кидай сюда видео (файлом или как видео) — прогоню через настоящий Edits на "
+                                    "айфоне (2K, 60 fps) и пришлю ответом на каждое. Несколько подряд — одной "
+                                    f"пачкой. В «{DONE_TOPIC}» — кнопка «📱 В Edits» под клипом или ответ "
+                                    "<code>edits</code> на видео.", topic=have[title])
+        self.edits_topics = {have[t] for t in titles}
+        self.drop_topic = have[et["drop_title"]] if et and et.get("drop_title") else None
+
+    async def on_edits_reply(self, event, text):
+        """Темы «Прогон Edits» / «Вопросы прогона»: прогон (edits_iphone.py) спросил, что нажать, — ответ «N» / «повтори» / «стоп»
+        или скрин с точкой там, куда нажать, — дописываем в файл, прогон читает его сам
+        (у бота один читатель сообщений — этот процесс)."""
+        replies = Path(self.cfg["edits_topic"]["replies"])
+        t = text.strip().lower()
+        if event.photo or (event.document and (event.file.mime_type or "").startswith("image/")):
+            pic = replies.with_name(f"reply-{event.id}.jpg")
+            await event.download_media(file=str(pic))
+            t = f"точка {pic}"
+        elif not EDITS_REPLY_RE.match(t):
+            return
+        with open(replies, "a", encoding="utf-8") as f:
+            f.write(f"{time.time():.0f}\t{t}\n")
+        log.info("ответ для прогона Edits: %s", t)
 
     async def on_links(self, event, text, topic):
         """Тема ссылок партнёрки: ссылки не качаем, а дописываем в её links.txt (дата<TAB>ссылка<TAB>sent|пусто),
@@ -1024,6 +1118,7 @@ class Bot:
         """На каждую ссылку сразу «⏳ В очереди · ссылка», сообщение человека удаляется.
         Готово → видео, «⏳» удаляется (текст в видео Telegram превратить не даёт); ошибка → «⏳» → «❌».
         Тема «Выбор клипов» — своя логика (on_pick)."""
+        from telethon import Button
         if event.chat_id != self.cfg["group_id"]:
             return
         text = event.raw_text or ""
@@ -1042,15 +1137,38 @@ class Bot:
         if topic and topic in self.link_topics:
             await self.on_links(event, text, topic)
             return
+        if topic and topic in self.edits_topics:
+            if event.sender_id == self.cfg["owner_id"]:
+                await self.on_edits_reply(event, text)
+            return  # ссылки здесь не качаем
+        if topic and topic == self.drop_topic:
+            if is_video(event.message):
+                if is_vertical(event.message):
+                    await self.edits_add(topic, event.message)
+                else:
+                    await self.send("В Edits — только вертикальные видео 9:16", topic=topic, reply_to=event.id)
+            return
+        if topic and topic == self.done_topic and replied and text.strip().lower() in EDITS_WORDS:
+            msg = await self.client.get_messages(self.group, ids=replied)
+            if msg and is_video(msg) and is_vertical(msg):
+                await self.edits_add(topic, msg)
+                await self.delete(event.id)
+                if msg.out:
+                    await self.set_buttons(msg.id, [Button.inline("⏳ В очереди Edits", b"edits-wait")])
+            return
         jobs = parse_message(text)
         if not jobs:
             return  # обычная переписка — не трогаем
         for url, cut, _quote, _offset in jobs:
             if isinstance(cut, CutError):
                 await self.send(f"❌ {esc(str(cut))} — пример: ссылка 1:20-1:45 · {link(url)}", topic=topic)
+            elif cut_key(url, cut) in self.inflight:
+                log.info("уже в очереди: %s", cut_key(url, cut))  # та же ссылка второй раз — не качать дважды
             else:
                 wait = self.queue.qsize() + self.busy
-                ph = await self.send(f"⏳ В очереди{f': {wait + 1}' if wait else ''} · {link(url)}", topic=topic)
+                ph = await self.send(f"⏳ В очереди{f': {wait + 1}' if wait else ''} · {link(url)}", topic=topic,
+                                     buttons=CANCEL_BTN())
+                self.inflight[cut_key(url, cut)] = ph.id
                 await self.queue.put({"ph": ph.id, "url": url, "cut": cut, "topic": topic})
         await self.delete(event.id)
 
@@ -1063,7 +1181,7 @@ class Bot:
         wait = self.queue.qsize() + self.busy
         what = f"креатив «{esc(caption)}» · " if caption else ""
         ph = await self.send(f"⏳ В очереди{f': {wait + 1}' if wait else ''} · {what}{cut_label(cut)}",
-                             topic=self.pick_topic, reply_to=reply_to)
+                             topic=self.pick_topic, reply_to=reply_to, buttons=CANCEL_BTN())
         await self.queue.put({"ph": ph.id, "url": pick["url"], "cut": cut, "topic": self.done_topic,
                               "pick": pick, "pick_msg": pick_msg, "who": who, "caption": caption})
 
@@ -1076,6 +1194,28 @@ class Bot:
             msg = await event.get_message()
             await self.edit(event.message_id, esc(msg.message or "Ещё"))
             await self.pick_queue.put({"kind": "more", "reply_to": event.message_id})
+            return
+        if event.data in (b"edits", b"edits-yes", b"edits-no", b"edits-wait", b"edits-done"):
+            await self.on_edits_button(event)
+            return
+        if event.data in (b"eq-up", b"eq-down"):  # «⬆️ Выше / ⬇️ Ниже» под ждущей пачкой — только владелец
+            if event.sender_id != self.cfg["owner_id"]:
+                await event.answer(f"Очередь двигает {OWNER}")
+                return
+            j = next((j for j in self.state.get("edits_jobs", []) if j["status"] == event.message_id), None)
+            moved = j and await asyncio.to_thread(self.equeue().move, j["pid"], -1 if event.data == b"eq-up" else 1)
+            await event.answer("Сдвинул ✅" if moved else "Двигать некуда")
+            if moved:
+                await self.edits_show()
+            return
+        if event.data == b"edits-again":  # «🔁 Повторить» под остановившимся прогоном
+            await event.answer("Повторяю 🔁")
+            await self.edits_retry(event.message_id)
+            return
+        if event.data == b"cancel":  # «✖️ Отмена» под «⏳»: ждёт — не начнётся; в работе — результат не пришлём
+            await event.answer("Отменил ✖️")
+            self.cancelled.add(event.message_id)
+            await self.delete(event.message_id)
             return
         if event.data != b"take":
             return
@@ -1222,6 +1362,11 @@ class Bot:
             job = await self.queue.get()
             ph, url, cut, topic = job["ph"], job["url"], job["cut"], job["topic"]
             pick = job.get("pick")  # отбор из «Выбора клипов»: видео — в «Отобранные», «⏳» — в «Выборе»
+            if ph in self.cancelled:
+                self.inflight.pop(cut_key(url, cut), None)
+                if pick and job["pick_msg"] in self.state.get("taking", []):
+                    self.state["taking"].remove(job["pick_msg"])
+                continue
             self.busy = 1
             key = cut_key(url, cut)
             n += 1
@@ -1237,14 +1382,17 @@ class Bot:
                         await self.delete(ph)
                         log.info("повтор %s", key)
                         continue
-                await self.edit(ph, f"⏳ В работе · {link(url)}")
+                await self.edit(ph, f"⏳ В работе · {link(url)}", CANCEL_BTN())
                 out, p = await asyncio.to_thread(process, url, cut, self.cfg, work)
                 text = job.get("caption")  # подпись → классический креатив
                 if text:
-                    await self.edit(ph, f"⏳ Собираю креатив · {link(url)}")
+                    await self.edit(ph, f"⏳ Собираю креатив · {link(url)}", CANCEL_BTN())
                     streamer = p["streamer"]
                     out, p = await asyncio.to_thread(make_creative, out, text, work)
                     p["streamer"] = streamer
+                if ph in self.cancelled:  # отменили, пока качалось — не отправлять
+                    log.info("отменено %s", key)
+                    continue
                 await self.edit(ph, f"⏳ Отправляю · {link(url)}")
                 q = f"{p['h']}p{round(p['fps'])}" if p["fps"] >= 50 else f"{p['h']}p"
                 caption = f"{esc(p['streamer'])} · {cut_label(cut)} · {q} · {link(url)}"
@@ -1256,7 +1404,8 @@ class Bot:
                 media = video_media(await self.client.upload_file(str(out)),
                                     await self.client.upload_file(str(p["thumb"])) if p["thumb"] else None,
                                     p, p["streamer"])
-                sent = await self.send(caption, media, topic=topic)
+                sent = await self.send(caption, media, topic=topic,
+                                       buttons=EDITS_BTN() if pick and self.drop_topic and p["h"] > p["w"] else None)
                 if pick:
                     what = "креатив · " if text else ""
                     await self.edit(ph, f"✅ в «{DONE_TOPIC}» · {what}{cut_label(cut)} · {esc(job['who'])}")
@@ -1281,9 +1430,273 @@ class Bot:
                 await self.edit(ph, f"❌ Не скачал, {OWNER} {'решит' + hint if hint else 'посмотрит'} · {link(url)}")
             finally:
                 self.busy = 0
+                self.inflight.pop(key, None)
+                self.cancelled.discard(ph)
                 shutil.rmtree(work, ignore_errors=True)
                 if pick and job["pick_msg"] in self.state.get("taking", []):
                     self.state["taking"].remove(job["pick_msg"])  # кнопку можно нажать снова, если сбой
+
+    # ---------- прогон через Edits на айфоне (20.10.2026, только с config.json → edits_topic.drop_title) ----------
+    # Видео из темы «Кинуть в Edits» и из «Отобранных» (кнопка / ответ «edits») копятся EDITS_GATHER_S секунд и
+    # уходят одной пачкой: папка задания в edits_topic.jobs_dir, отдельный процесс edits_iphone.py (у него своя
+    # очередь — одна серия за раз на телефон). Задания — в state["edits_jobs"]: бот перезапустился — дождётся
+    # процесса по pid и всё равно пришлёт готовое ответом на каждое исходное видео.
+
+    async def set_buttons(self, msg_id, buttons):
+        from telethon.tl import functions
+        try:
+            await self.client(functions.messages.EditMessageRequest(
+                peer=self.peer, id=msg_id, reply_markup=self.client.build_reply_markup(buttons)))
+        except Exception as e:
+            log.warning("кнопки %s не поменял: %s", msg_id, e)
+
+    async def on_edits_button(self, event):
+        """«📱 Прогнать через Edits» под видео в «Отобранных» / «Кинуть в Edits» → сразу в общую очередь айфона
+        (подтверждение «точно?» убрано по просьбе Димы 20.10.2026; «edits-yes / edits-no» — кнопки старых сообщений)."""
+        from telethon import Button
+        d, mid = event.data, event.message_id
+        if d == b"edits-wait":
+            busy = ({f["reply_to"] for j in self.state.get("edits_jobs", []) for f in j["files"]}
+                    | {x["id"] for x in self.state.get("edits_pending", [])})
+            if mid in busy:
+                await event.answer("Уже в очереди на айфон")
+                return
+            # «⏳» висит, а в очереди его нет (сбой / прерванная пачка) — ставим заново
+        if d == b"edits-done":
+            await event.answer("Уже прогнан — готовое ответом ниже")
+            return
+        if d == b"edits-no":
+            await event.answer("Ок, не трогаю")
+            await self.set_buttons(mid, EDITS_BTN())
+            return
+        msg = await event.get_message()
+        if not (msg and is_video(msg) and is_vertical(msg)):
+            await event.answer("В Edits — только вертикальные видео 9:16")
+            return
+        topic = msg_topic(msg)
+        if topic not in (self.done_topic, self.drop_topic):
+            await event.answer("Эта кнопка тут не работает")
+            return
+        added = await self.edits_add(topic, msg)
+        await event.answer("В очереди на айфон 📱" if added else "Уже в очереди")
+        await self.set_buttons(mid, [Button.inline("⏳ В очереди Edits", b"edits-wait")])
+
+    async def edits_add(self, topic, msg):
+        """Видео — в ожидание (state["edits_pending"], переживает перезапуск бота). → False, если уже ждёт или в работе.
+        Пачку собирает edits_dispatch: пока айфон занят — копит всё, освободился — забирает накопленное разом
+        (20.10.2026, Дима: «за 10 минут прогона наклацаю пару пачек — пусть едут вместе»)."""
+        busy = {(j["topic"], f["reply_to"]) for j in self.state.get("edits_jobs", []) for f in j["files"]}
+        pend = self.state.setdefault("edits_pending", [])
+        if (topic, msg.id) in busy or any(x["topic"] == topic and x["id"] == msg.id for x in pend):
+            return False
+        pend.append({"topic": topic, "id": msg.id})
+        self.save()
+        self.edits_last = time.time()
+        return True
+
+    def edits_busy(self):
+        """Айфон занят: живой прогон бота (не остановленный) или любой прогон в очереди edits_queue."""
+        import psutil
+        for j in self.state.get("edits_jobs", []):
+            if j.get("stuck"):
+                continue
+            try:
+                if abs(psutil.Process(j["pid"]).create_time() - j["created"]) < 1:
+                    return True
+            except psutil.Error:
+                pass
+        return bool(self.equeue().edit())
+
+    async def edits_dispatch(self):
+        """Раз в 3 с: есть ждущие и айфон свободен (и EDITS_GATHER_S с последнего нажатия прошло) → все ждущие
+        одной темы, начиная со старшего, — одной пачкой (у тем разный режим: «Отобранные» — только в галерею)."""
+        while True:
+            await asyncio.sleep(3)
+            pend = self.state.get("edits_pending") or []
+            if not pend or time.time() - self.edits_last < EDITS_GATHER_S:
+                continue
+            try:
+                if await asyncio.to_thread(self.edits_busy):
+                    continue
+            except Exception:
+                log.exception("Edits: не понял, занят ли айфон")
+                continue
+            topic = pend[0]["topic"]
+            take = [x for x in pend if x["topic"] == topic]
+            msgs = [m for m in await self.client.get_messages(self.group, ids=[x["id"] for x in take]) if m]
+            try:
+                await self.edits_start(topic, msgs)
+            except Exception:
+                log.exception("Edits: не запустил пачку")
+                if msgs:
+                    await self.send(f"❌ Edits: не смог запустить прогон, {OWNER} посмотрит", topic=topic,
+                                    reply_to=msgs[0].id)
+            # убрать взятые и после сбоя: иначе бот будет пытаться без конца (кнопку можно нажать снова)
+            self.state["edits_pending"] = [x for x in self.state.get("edits_pending", []) if x not in take]
+            self.save()
+
+    async def edits_start(self, topic, msgs):
+        et = self.cfg["edits_topic"]
+        job = Path(et["jobs_dir"]) / datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        job.mkdir(parents=True, exist_ok=True)
+        st = await self.send(f"⏳ Edits: забираю {len(msgs)} шт…", topic=topic, reply_to=msgs[0].id)
+        # клип, который бот сам делал, уже лежит в out_dir (тот же файл байт в байт) — взять оттуда жёсткой ссылкой,
+        # не качать; остальное — из Telegram по 3 сразу (20.10.2026: пятёрка по одному качалась 7 минут)
+        local = {}
+        try:
+            for e in os.scandir(self.cfg["out_dir"]):
+                if e.name.lower().endswith(".mp4") and e.is_file():
+                    local.setdefault(e.stat().st_size, e.path)
+        except OSError:
+            pass
+        sem = asyncio.Semaphore(3)
+
+        async def get(i, m):
+            stem = re.sub(r"[^\w.-]", "_", Path(m.file.name or f"video{m.id}").stem)[:40]
+            dst = job / f"{i:02d}_{stem}.mp4"
+            src = local.get(m.file.size)
+            if src:
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    await asyncio.to_thread(shutil.copy2, src, dst)
+            else:
+                async with sem:
+                    await m.download_media(file=str(dst))
+            return {"file": dst.name, "reply_to": m.id, "btn": bool(m.out)}  # btn — под ним наша кнопка
+        files = list(await asyncio.gather(*(get(i, m) for i, m in enumerate(msgs, 1))))
+        j = {"dir": str(job), "topic": topic, "status": st.id, "files": files}
+        self.edits_launch(j)
+        self.state.setdefault("edits_jobs", []).append(j)
+        self.save()
+        await self.edit(st.id, f"⏳ Edits: {len(files)} шт — в очереди на айфон. Ход и вопросы — "
+                               f"в «{et.get('ask_title') or et['title']}»")
+        log.info("Edits: пачка %s, %s шт", job.name, len(files))
+
+    def edits_launch(self, j):
+        import psutil
+        script = Path(self.cfg["edits_topic"]["script"])
+        exe = Path(sys.executable).with_name("python.exe")
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        with open(Path(j["dir"]) / "run.log", "a", encoding="utf-8") as out:
+            # из «Отобранных» готовое остаётся только в галерее айфона (Дима 20.10.2026) — в Telegram не шлём
+            keep = ["--phone-only"] if j["topic"] == self.done_topic else []
+            pr = subprocess.Popen([str(exe), "-u", str(script), j["dir"], *keep], stdout=out, stderr=subprocess.STDOUT,
+                                  cwd=str(script.parent), env=env,
+                                  # без DETACHED: скрытая консоль на весь прогон — иначе каждый ffmpeg/ffprobe/
+                                  # pymobiledevice3 открывал своё мелькающее окно (Дима, 20.10.2026)
+                                  creationflags=0x00000200 | NO_WINDOW, close_fds=True)
+        j["pid"], j["created"] = pr.pid, psutil.Process(pr.pid).create_time()
+
+    def equeue(self):
+        """Модуль очереди айфона (tools/wda/edits_queue.py рядом со скриптом прогона)."""
+        d = str(Path(self.cfg["edits_topic"]["script"]).parent)
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import edits_queue
+        return edits_queue
+
+    async def edits_show(self):
+        """Статус каждой живой пачки: место в очереди и «⬆️ Выше / ⬇️ Ниже» — пока ждёт; «▶️ на айфоне» — когда идёт.
+        Правим, только если текст поменялся."""
+        from telethon import Button
+        eq = self.equeue()
+        ask = self.cfg["edits_topic"].get("ask_title") or self.cfg["edits_topic"]["title"]
+        for j in self.state.get("edits_jobs", []):
+            if j.get("stuck"):
+                continue
+            pos, total = await asyncio.to_thread(eq.position, j["pid"])
+            n = len(j["files"])
+            if pos is None:  # процесс ещё не встал в очередь / уже вышел — покажет edits_watch
+                continue
+            if pos == 0:
+                text, buttons = f"▶️ Edits: {n} шт — сейчас на айфоне. Ход и вопросы — в «{ask}»", None
+            else:
+                text = f"⏳ Edits: {n} шт — в очереди на айфон: {pos}-я из {total}. Ход и вопросы — в «{ask}»"
+                buttons = [Button.inline("⬆️ Выше", b"eq-up"), Button.inline("⬇️ Ниже", b"eq-down")]
+            if j.get("shown") != text:
+                try:
+                    await self.client.edit_message(self.group, j["status"], text, buttons=buttons)
+                    j["shown"] = text
+                    self.save()
+                except Exception as e:
+                    log.warning("статус Edits %s не поправил: %s", j["status"], e)
+
+    async def edits_watch(self):
+        """Раз в 15 с: процесс задания закончился → прислать готовое; живые — место в очереди."""
+        import psutil
+        while True:
+            for j in list(self.state.get("edits_jobs", [])):
+                try:
+                    alive = abs(psutil.Process(j["pid"]).create_time() - j["created"]) < 1
+                except psutil.Error:
+                    alive = False
+                if not alive and not j.get("stuck"):
+                    try:
+                        await self.edits_deliver(j)
+                    except Exception:
+                        log.exception("Edits: не отдал %s", j["dir"])
+            try:
+                await self.edits_show()
+            except Exception:
+                log.exception("Edits: статусы очереди")
+            await asyncio.sleep(15)
+
+    async def edits_deliver(self, j):
+        from telethon import Button
+        job = Path(j["dir"])
+        done_f = job / ".iphone-done.txt"
+        done = set(done_f.read_text(encoding="utf-8").split()) if done_f.exists() else set()
+        if j["topic"] == self.done_topic:  # --phone-only: готовое в галерее айфона, файлов на ноутбуке нет
+            for f in j["files"]:
+                if f["file"] in done and not f.get("sent"):
+                    await self.set_buttons(f["reply_to"], [Button.inline("✅ Edits · в галерее айфона",
+                                                                         b"edits-done")])
+                    f["sent"] = True
+                    self.save()
+        for f in j["files"]:
+            if f["file"] in done and not f.get("sent"):
+                path = job / f["file"]
+                pr = await asyncio.to_thread(probe, str(path))
+                media = video_media(await self.client.upload_file(str(path)), None, pr, Path(f["file"]).stem)
+                await self.send(f"📱 после Edits · {pr['w']}×{pr['h']} · {round(pr['fps'])} fps", media,
+                                topic=j["topic"], reply_to=f["reply_to"])
+                if f.get("btn", j["topic"] == self.done_topic):
+                    await self.set_buttons(f["reply_to"], [Button.inline("✅ Прогнан через Edits", b"edits-done")])
+                f["sent"] = True
+                self.save()
+        n, ok = len(j["files"]), sum(1 for f in j["files"] if f.get("sent"))
+        if ok == n:
+            where = " — в галерее айфона" if j["topic"] == self.done_topic else ""
+            await self.edit(j["status"], f"✅ Edits: готово {n} из {n}{where}")
+            self.state["edits_jobs"].remove(j)
+            self.save()
+            shutil.rmtree(job, ignore_errors=True)
+            # исходники прогон откладывает в tools/wda/backup/<папка> (диск C) — они и так есть в Telegram
+            shutil.rmtree(Path(self.cfg["edits_topic"]["data_dir"]) / "backup" / job.name, ignore_errors=True)
+            log.info("Edits: пачка %s готова", job.name)
+            return
+        j["stuck"] = True  # остановился (ответ «стоп», сбой, телефон не на связи) — ждём «🔁 Повторить»
+        self.save()
+        if (job / ".phone-offline").exists():  # метка edits_iphone.py: до телефона так и не достучался
+            text = (f"📵 Edits: телефон не на связи — готово {ok} из {n}. Подключи кабель, разблокируй айфон "
+                    "и нажми «🔁 Повторить».")
+        else:
+            text = (f"⚠️ Edits: готово {ok} из {n}, прогон остановился — причина в "
+                    f"«{self.cfg['edits_topic'].get('ask_title')}». «🔁 Повторить» продолжит с места остановки.")
+        await self.client.edit_message(self.group, j["status"], text,
+                                       buttons=[Button.inline("🔁 Повторить", b"edits-again")])
+        log.info("Edits: пачка %s остановилась на %s из %s", job.name, ok, n)
+
+    async def edits_retry(self, status_id):
+        for j in self.state.get("edits_jobs", []):
+            if j["status"] == status_id and j.get("stuck"):
+                self.edits_launch(j)
+                j.pop("stuck", None)
+                j.pop("shown", None)
+                self.save()
+                await self.edit(status_id, "⏳ Edits: повторяю — в очереди на айфон")
+                return
 
     def copy_out(self, out, streamer, cut, suffix=""):
         d = Path(self.cfg["out_dir"])
@@ -1345,7 +1758,8 @@ class Bot:
         await self.client.start(bot_token=token)
         self.group = await self.client.get_entity(self.cfg["group_id"])
         self.peer = await self.client.get_input_entity(self.group)
-        self.pick_topic = self.done_topic = None
+        self.pick_topic = self.done_topic = self.drop_topic = None
+        self.edits_topics = set()
         self.link_topics = {}
         try:
             await self.ensure_topics()
@@ -1354,6 +1768,8 @@ class Bot:
         self.client.add_event_handler(self.on_message, events.NewMessage(incoming=True))  # свои — нет
         self.client.add_event_handler(self.on_button, events.CallbackQuery())
         jobs = [self.worker(), self.pick_worker(), self.status_loop(), self.stop_watch()]
+        if self.drop_topic:
+            jobs += [self.edits_watch(), self.edits_dispatch()]
         if KIT:
             jobs.append(self.update_loop())
             if self.state.get("version") != KIT["version"]:

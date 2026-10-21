@@ -23,7 +23,7 @@ if (-not (Test-Path $Py)) {
     Write-Host '      скачиваю (~25 МБ)'
     Get-File 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe' $exe
     Write-Host '      устанавливаю, 1–3 минуты, окно не закрывай'
-    Start-Process $exe -Wait -ArgumentList '/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_test=0', 'Include_launcher=0', `
+    Start-Process $exe -Wait -ArgumentList '/quiet', '/log', "`"$Data\python-install.log`"", 'InstallAllUsers=0', 'PrependPath=0', 'Include_test=0', 'Include_launcher=0', `
         'Include_doc=0', 'Include_tcltk=0', 'Include_dev=0'
     Remove-Item $exe -ErrorAction SilentlyContinue
     if (-not (Test-Path $Py)) { throw 'Python не установился' }
@@ -47,6 +47,7 @@ if (-not (Test-Path "$Bin\ffmpeg.exe")) {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive $zip $tmp
     Copy-Item (Get-ChildItem $tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName "$Bin\ffmpeg.exe"
+    Copy-Item (Get-ChildItem $tmp -Recurse -Filter ffprobe.exe | Select-Object -First 1).FullName "$Bin\ffprobe.exe"
     Remove-Item $zip, $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
@@ -56,6 +57,13 @@ if (-not (Test-Path "$Data\config.json")) {
     if ($LASTEXITCODE -ne 0) { throw 'настройка не закончена — запусти install.bat ещё раз' }
 } else {
     Write-Host '      уже настроен (чтобы настроить заново — удали папку data)'
+}
+
+# айфон + Instagram Edits — по желанию (21.10.2026): до автозапуска, чтобы бот сразу создал свои темы
+if (-not (Test-Path "$Data\wda\tunnel-task.ok")) {
+    $ans = if ($env:KIT_IPHONE) { $env:KIT_IPHONE } else {   # KIT_IPHONE=y — без вопроса (проверка в песочнице)
+        Read-Host "`nСтавить айфон-часть (прогон видео через Instagram Edits на iPhone)? [y/N]" }
+    if ($ans -match '^(y|yes|д|да)') { & (Join-Path $Root 'install-iphone.ps1') }
 }
 
 Write-Host '[6/6] Автозапуск'
